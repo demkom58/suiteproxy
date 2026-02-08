@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OpenMemory Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: #0f1117; color: #e1e4e8; line-height: 1.5; }
+  .header { background: #161b22; border-bottom: 1px solid #30363d; padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
+  .header h1 { font-size: 18px; font-weight: 600; }
+  .header .stats { color: #8b949e; font-size: 13px; margin-left: auto; }
+  .container { max-width: 960px; margin: 0 auto; padding: 24px; }
+  .controls { display: flex; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+  .controls input { flex: 1; min-width: 200px; padding: 8px 12px; border-radius: 6px; border: 1px solid #30363d; background: #0d1117; color: #e1e4e8; font-size: 14px; outline: none; }
+  .controls input:focus { border-color: #58a6ff; }
+  .tags-bar { display: flex; gap: 6px; margin-bottom: 16px; flex-wrap: wrap; }
+  .tag-btn { padding: 4px 10px; border-radius: 12px; border: 1px solid #30363d; background: #161b22; color: #8b949e; font-size: 12px; cursor: pointer; transition: all 0.15s; }
+  .tag-btn:hover, .tag-btn.active { background: #1f6feb; color: #fff; border-color: #1f6feb; }
+  .memory-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 12px; transition: border-color 0.15s; }
+  .memory-card:hover { border-color: #58a6ff; }
+  .memory-content { font-size: 14px; white-space: pre-wrap; word-break: break-word; margin-bottom: 10px; }
+  .memory-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .memory-tags { display: flex; gap: 4px; flex-wrap: wrap; }
+  .memory-tag { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; }
+  .memory-tag.decision { background: #1a3a2a; color: #56d364; }
+  .memory-tag.bug { background: #3d1f1f; color: #f85149; }
+  .memory-tag.architecture { background: #1c2d4a; color: #58a6ff; }
+  .memory-tag.pattern { background: #2d2a1c; color: #d29922; }
+  .memory-tag.proxy { background: #2a1c3d; color: #bc8cff; }
+  .memory-tag.reverse-engineering { background: #3d1c2a; color: #f778ba; }
+  .memory-tag.botguard { background: #1c3d3d; color: #39d353; }
+  .memory-tag.preference { background: #2d1c1c; color: #da3633; }
+  .memory-tag.todo { background: #2d2a1c; color: #e3b341; }
+  .memory-tag.api-discovery { background: #1c2d3d; color: #79c0ff; }
+  .memory-tag.auth-flow { background: #3d2d1c; color: #d2a8ff; }
+  .memory-tag.default { background: #21262d; color: #8b949e; }
+  .memory-time { color: #484f58; font-size: 12px; margin-left: auto; }
+  .memory-delete { background: none; border: none; color: #484f58; cursor: pointer; font-size: 16px; padding: 2px 6px; border-radius: 4px; }
+  .memory-delete:hover { color: #f85149; background: #3d1f1f; }
+  .empty { text-align: center; padding: 60px 20px; color: #484f58; }
+  .empty h2 { font-size: 20px; margin-bottom: 8px; color: #8b949e; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>OpenMemory</h1>
+  <span class="stats" id="stats">Loading...</span>
+</div>
+<div class="container">
+  <div class="controls">
+    <input type="text" id="search" placeholder="Search memories..." autofocus>
+  </div>
+  <div class="tags-bar" id="tags-bar"></div>
+  <div id="memories"></div>
+</div>
+<script>
+const API = window.location.origin;
+let allMemories = [];
+let activeTag = null;
+
+async function load() {
+  const [listRes, tagsRes] = await Promise.all([
+    fetch(`${API}/api/memory/list`).then(r => r.json()),
+    fetch(`${API}/api/memory/tags`).then(r => r.json())
+  ]);
+  allMemories = listRes.results || [];
+  document.getElementById('stats').textContent = `${allMemories.length} memories`;
+  renderTags(tagsRes.tags || {});
+  render();
+}
+
+function renderTags(tagCounts) {
+  const bar = document.getElementById('tags-bar');
+  const sorted = Object.entries(tagCounts).sort((a, b) => b[1] - a[1]);
+  bar.innerHTML = `<button class="tag-btn ${!activeTag ? 'active' : ''}" onclick="setTag(null)">All</button>` +
+    sorted.map(([t, c]) => `<button class="tag-btn ${activeTag === t ? 'active' : ''}" onclick="setTag('${t}')">${t} (${c})</button>`).join('');
+}
+
+function setTag(t) { activeTag = t === activeTag ? null : t; load(); }
+
+function render() {
+  const q = document.getElementById('search').value.toLowerCase();
+  const filtered = allMemories.filter(m => {
+    if (activeTag && !(m.tags || []).includes(activeTag)) return false;
+    if (q && !m.content.toLowerCase().includes(q)) return false;
+    return true;
+  });
+  const el = document.getElementById('memories');
+  if (!filtered.length) {
+    el.innerHTML = `<div class="empty"><h2>No memories found</h2><p>${q ? 'Try a different search' : 'Memories from agent sessions will appear here'}</p></div>`;
+    return;
+  }
+  el.innerHTML = filtered.map(m => `
+    <div class="memory-card">
+      <div class="memory-content">${esc(m.content)}</div>
+      <div class="memory-meta">
+        <div class="memory-tags">${(m.tags||[]).map(t => `<span class="memory-tag ${tagClass(t)}">${esc(t)}</span>`).join('')}</div>
+        <span class="memory-time">${timeAgo(m.created_at)}${m.user_id && m.user_id !== 'default' ? ` · ${esc(m.user_id)}` : ''}</span>
+        <button class="memory-delete" onclick="del('${m.id}')" title="Delete">×</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+function tagClass(t) {
+  const known = ['decision','bug','architecture','pattern','proxy','reverse-engineering','botguard','preference','todo','api-discovery','auth-flow'];
+  return known.includes(t) ? t : 'default';
+}
+
+async function del(id) {
+  if (!confirm('Delete this memory?')) return;
+  await fetch(`${API}/api/memory/${id}`, { method: 'DELETE' });
+  load();
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+function timeAgo(iso) {
+  const s = Math.floor((Date.now() - new Date(iso)) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.floor(s/60)}m ago`;
+  if (s < 86400) return `${Math.floor(s/3600)}h ago`;
+  return `${Math.floor(s/86400)}d ago`;
+}
+
+document.getElementById('search').addEventListener('input', render);
+load();
+setInterval(load, 15000);
+</script>
+</body>
+</html>

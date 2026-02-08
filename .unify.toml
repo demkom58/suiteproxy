@@ -1,0 +1,39 @@
+language = ["javascript"]
+
+ignores = [
+    # VCS and IDE
+    ".git/",
+    ".vscode/",
+    ".idea/",
+    ".nuxt/",
+    ".opencode/",
+    "node_modules/",
+
+    "*.lock",
+    "*.ttf",
+    "unified.md",
+    "**unified.md",
+
+    # Unify output
+    "/data/",
+    "/.unify.toml",
+    "/README.md",
+    "/.gitignore",
+]
+
+# extra_ignores = ["my-custom-dir/"]
+# includes = ["src/**", "Cargo.toml"]
+
+recursive = true
+follow_symlinks = false
+skip_binary = true
+# max_file_size = "1MB"
+
+format = "markdown"  # plain, markdown, xml, json
+output = "suiteproxy.nuxt.md"
+# wrap_code_block = false
+# code_block_lang = "auto"
+# toc = false
+
+header_template = "File: `{relative_path}`:\n"
+# footer_template = "\n"

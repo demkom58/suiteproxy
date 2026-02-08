@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "SuiteProxy Bridge",
+  "version": "1.0.0",
+  "description": "Syncs AI Studio session cookies to your SuiteProxy server",
+  "permissions": [
+    "cookies",
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://*.google.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "scripts": ["background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://aistudio.google.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "SuiteProxy Bridge"
+  },
+  "icons": {
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "suiteproxy-bridge@local",
+      "strict_min_version": "109.0"
+    }
+  }
+}
