@@ -1,10 +1,11 @@
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 
-// Ensure data dir exists for Docker volumes
-if (!existsSync("./data")) mkdirSync("./data");
+if (!existsSync("./data")) {
+    mkdirSync("./data");
+}
 
-const db = new Database("./data/accounts.sqlite", { create: true });
+const db = new Database("./data/accounts.sqlite");
 
 db.run(`CREATE TABLE IF NOT EXISTS accounts (
     id TEXT PRIMARY KEY,    
@@ -19,8 +20,17 @@ export async function generateTripleHash(sapisid: string): Promise<string> {
     const ts = Math.floor(Date.now() / 1000);
     const origin = "https://aistudio.google.com";
     const input = `${ts} ${sapisid} ${origin}`;
-    const hash = new Bun.CryptoHasher("sha1").update(input).digest("hex");
     
+    const hash = new Bun.CryptoHasher("sha1").update(input).digest("hex");
     const sig = `${ts}_${hash}`;
+    
     return `SAPISIDHASH ${sig} SAPISID1PHASH ${sig} SAPISID3PHASH ${sig}`;
+}
+
+export function getSapiFromCookie(cookie: string): string | null {
+    const match3p = cookie.match(/__Secure-3PSAPISID=([^;]+)/);
+    if (match3p && match3p[1]) return match3p[1].replace(/"/g, '').trim();
+
+    const match = cookie.match(/SAPISID=([^;]+)/);
+    return match && match[1] ? match[1].replace(/"/g, '').trim() : null;
 }

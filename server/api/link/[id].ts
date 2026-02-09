@@ -3,10 +3,9 @@ import { accountBus, ACTIONS } from "~~/server/utils/bus";
 
 export default defineEventHandler(async (event) => {
   setResponseHeaders(event, {
-    "Access-Control-Allow-Origin": "https://aistudio.google.com",
+    "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
-    "Access-Control-Allow-Credentials": "true",
   });
 
   if (event.method === 'OPTIONS') return null;
@@ -16,15 +15,21 @@ export default defineEventHandler(async (event) => {
   const body = await readBody(event);
 
   if (!id || !body) throw createError({ statusCode: 400 });
+  
+  // Validation: Ensure SSID is present
+  if (!body.cookie || !body.cookie.includes("SSID")) {
+      console.warn(`[Link] Attempt to link ${id} without SSID cookie.`);
+      // We accept it, but warn
+  }
 
   const db = useDb();
-  // INSERT OR REPLACE handles the "Update existing email" requirement
+  
+  // Save credentials directly
   db.run(
     "INSERT OR REPLACE INTO accounts (id, creds, last_sync, limited_until) VALUES (?, ?, ?, ?)", 
     [id, JSON.stringify(body), Date.now(), 0]
   );
 
-  // Broadcast to all listeners (including those in other tabs/incognito)
   accountBus.emit(ACTIONS.ACCOUNTS_CHANGED);
 
   return { success: true };

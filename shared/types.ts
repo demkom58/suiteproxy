@@ -7,6 +7,7 @@ export interface SuitemakerCreds {
   nonce: string;
   toggles: string[];
   authUser: string;
+  userAgent?: string;
 }
 
 // The gRPC-web array format for GenerateContent
