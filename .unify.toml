@@ -1,0 +1,37 @@
+language = ["javascript"]
+
+ignores = [
+    # VCS and IDE
+    ".git/",
+    ".vscode/",
+    ".idea/",
+    ".nuxt/",
+    "node_modules/",
+
+    "*.lock",
+    "*.ttf",
+    "unified.md",
+    "**unified.md",
+
+    # Unify output
+    "/data/",
+    "/.unify.toml",
+    "/README.md",
+]
+
+# extra_ignores = ["my-custom-dir/"]
+# includes = ["src/**", "Cargo.toml"]
+
+recursive = true
+follow_symlinks = false
+skip_binary = true
+# max_file_size = "1MB"
+
+format = "markdown"  # plain, markdown, xml, json
+# output = "unified.txt"
+# wrap_code_block = false
+# code_block_lang = "auto"
+# toc = false
+
+header_template = "File: `{relative_path}`:\n"
+# footer_template = "\n"
