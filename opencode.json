@@ -1,0 +1,56 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": ["./AGENTS.md", ".opencode/rules/*.md"],
+  "model": "anthropic/claude-opus-4-6",
+  "small_model": "anthropic/claude-sonnet-4-5",
+
+  "mcp": {
+    "playwright": {
+      "type": "local",
+      "command": ["npx", "@playwright/mcp@latest", "--browser", "chrome", "--cdp-endpoint", "http://localhost:9222"],
+      "enabled": true
+    },
+    "context7": {
+      "type": "remote",
+      "url": "https://mcp.context7.com/mcp",
+      "enabled": true
+    },
+    "gh_grep": {
+      "type": "remote",
+      "url": "https://mcp.grep.app",
+      "enabled": true
+    },
+    "memory": {
+      "type": "local",
+      "command": ["node", ".opencode/scripts/memory-mcp.mjs"],
+      "enabled": true
+    }
+  },
+
+  "permission": {
+    "edit": "allow",
+    "bash": {
+      "*": "ask",
+      "bun *": "allow",
+      "bunx *": "allow",
+      "npx *": "allow",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "git branch*": "allow",
+      "grep *": "allow",
+      "find *": "allow",
+      "ls *": "allow",
+      "cat *": "allow",
+      "head *": "allow",
+      "tail *": "allow",
+      "wc *": "allow",
+      "curl *": "ask",
+      "docker *": "ask",
+      "rm *": "ask",
+      "git push*": "ask",
+      "git commit*": "ask"
+    },
+    "webfetch": "allow"
+  }
+}

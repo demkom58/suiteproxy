@@ -1,0 +1,38 @@
+services:
+  browser:
+    image: lscr.io/linuxserver/msedge:latest
+    container_name: msedge
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Kyiv
+      - EDGE_CLI=--remote-debugging-port=9222 --remote-allow-origins=* --no-first-run --disable-background-networking --disable-default-apps --disable-extensions --disable-sync --no-default-browser-check
+      - DOCKER_MODS=linuxserver/mods:universal-package-install
+      - INSTALL_PACKAGES=socat
+    ports:
+      - "3100:3000"   # Edge GUI (HTTP)
+      - "3101:3001"   # Edge GUI (HTTPS)
+      - "9222:9223"   # CDP for Playwright (socat 0.0.0.0:9223 -> 127.0.0.1:9222)
+    shm_size: "1gb"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - edge-config:/config
+      - ./edge-init:/custom-cont-init.d:ro
+    restart: unless-stopped
+
+  openmemory:
+    build:
+      context: ./openmemory
+    container_name: openmemory
+    ports:
+      - "8787:8080"   # API at /api/memory/* | Dashboard at http://localhost:8787/
+    volumes:
+      - openmemory-data:/app/data
+    environment:
+      - PORT=8080
+    restart: unless-stopped
+
+volumes:
+  openmemory-data:
+  edge-config:
