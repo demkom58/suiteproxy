@@ -3,13 +3,16 @@
  * Extracted from script id: 5214b93e-8e4f-44d0-9b6e-68042704d63a
  */
 export interface SuitemakerCreds {
-  cookie: string;       // Master session cookies (SAPISID, HSID, etc.)
-  at: string;           // 'SNlM0e' - CSRF / Action Token
-  api_key: string;      // 'PeqOqb' - Internal API Key
-  build: string;        // 'cfb2h' - e.g., "boq_alkali-makersuite_..."
-  flow_id: string;      // 'FdrFJe' - Current session flow identifier
-  nonce: string;        // 'WZsZ1e' - Build-specific security nonce
-  toggles: any[];       // window._F_toggles - Experimental features
+  cookie: string;          // Master session cookies (SAPISID, HSID, etc.)
+  at: string;              // 'SNlM0e' - CSRF / Action Token
+  api_key: string;         // 'PeqOqb' - Internal API Key
+  build: string;           // 'cfb2h' - e.g., "boq_alkali-makersuite_..."
+  flow_id: string;         // 'FdrFJe' - Current session flow identifier
+  nonce: string;           // 'WZsZ1e' - Build-specific security nonce
+  toggles: any[];          // window._F_toggles - Experimental features
+  authUser?: string;       // Optional: Google account index (0-9)
+  userAgent?: string;      // Optional: User agent string
+  session_token?: string;  // Optional: Active session token
 }
 
 /**

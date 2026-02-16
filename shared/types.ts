@@ -6,12 +6,11 @@ export interface SuitemakerCreds {
   flow_id: string;
   nonce: string;
   toggles: string[];
-  authUser: string;
-  userAgent?: string;
+  authUser?: string;        // Optional: Google account index (0-9)
+  userAgent?: string;       // Optional: User agent string
+  session_token?: string;   // Optional: Active session token
 }
 
-// The gRPC-web array format for GenerateContent
-// Based on: ["models/gemini-2.5-flash-image",[[[[null,"Hi!"]],"user"]],null,[...]...]
 export type SuitemakerRPCRequest = [
   string,          // 0: Model Name (e.g. "models/gemini-1.5-flash")
   any[],           // 1: Contents (History)

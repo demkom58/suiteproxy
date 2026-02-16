@@ -1,9 +1,0 @@
-services:
-  suiteproxy:
-    build: .
-    container_name: suiteproxy
-    ports:
-      - "3000:3000"
-    volumes:
-      - ./data:/app/data
-    restart: always

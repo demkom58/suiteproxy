@@ -6,6 +6,7 @@ ignores = [
     ".vscode/",
     ".idea/",
     ".nuxt/",
+    ".opencode/",
     "node_modules/",
 
     "*.lock",
@@ -17,6 +18,7 @@ ignores = [
     "/data/",
     "/.unify.toml",
     "/README.md",
+    "/.gitignore",
 ]
 
 # extra_ignores = ["my-custom-dir/"]
@@ -28,7 +30,7 @@ skip_binary = true
 # max_file_size = "1MB"
 
 format = "markdown"  # plain, markdown, xml, json
-# output = "unified.txt"
+output = "suiteproxy.nuxt.md"
 # wrap_code_block = false
 # code_block_lang = "auto"
 # toc = false

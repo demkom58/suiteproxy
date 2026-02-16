@@ -39,9 +39,12 @@
 
     async function handleSync() {
         let wiz = null;
+        // 1. Try global object
         if (unsafeWindow.WIZ_global_data) {
             wiz = unsafeWindow.WIZ_global_data;
-        } else {
+        } 
+        // 2. Try scraping script tags (Fallback)
+        else {
             const scripts = Array.from(document.querySelectorAll('script'));
             for (const s of scripts) {
                 if (s.textContent && s.textContent.includes('"SNlM0e"')) { 
@@ -54,7 +57,8 @@
 
         const userEmail = wiz.oPEP7c || "unknown";
         
-        // FIX: Prioritize QrtxK, then HiPsbb, then URL
+        // 3. Determine Auth User Index (Critical for multi-login)
+        // Order: QrtxK (in your data) -> HiPsbb -> URL Regex
         let authUser = "0";
         if (wiz.QrtxK !== undefined && wiz.QrtxK !== null) {
             authUser = String(wiz.QrtxK);
@@ -86,8 +90,9 @@
                     flow_id: wiz.FdrFJe,
                     nonce: wiz.WZsZ1e,
                     toggles: unsafeWindow._F_toggles || [],
-                    authUser: authUser, // Now uses QrtxK
-                    userAgent: navigator.userAgent
+                    authUser: authUser,
+                    // 4. Send the client's User Agent to the server
+                    userAgent: navigator.userAgent 
                 };
 
                 GM_xmlhttpRequest({
