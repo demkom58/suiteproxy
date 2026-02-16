@@ -26,6 +26,12 @@ logs
 
 *.joined.txt
 
-# .gitignore
+# Data
 data/
 !data/.gitkeep
+
+# Downloaded binaries
+.opencode/bin/
+
+# CIE index data
+.cie/data/

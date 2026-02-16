@@ -4,6 +4,8 @@ mode: subagent
 temperature: 0.1
 tools:
   memory*: true
+  sqlite*: true
+  github*: true
   write: false
   edit: false
 ---

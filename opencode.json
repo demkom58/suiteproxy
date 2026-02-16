@@ -24,6 +24,21 @@
       "type": "local",
       "command": ["node", ".opencode/scripts/memory-mcp.mjs"],
       "enabled": true
+    },
+    "github": {
+      "type": "local",
+      "command": ["bunx", "-y", "@modelcontextprotocol/server-github@latest"],
+      "enabled": true
+    },
+    "sqlite": {
+      "type": "local",
+      "command": ["bunx", "sqlite-mcp", "data/accounts.sqlite"],
+      "enabled": true
+    },
+    "cie": {
+      "type": "local",
+      "command": ["wsl", "-e", "/usr/local/bin/cie", "--mcp"],
+      "enabled": false
     }
   },
 

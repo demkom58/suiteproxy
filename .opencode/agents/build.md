@@ -35,6 +35,14 @@ You are the **Build** agent — the primary development workhorse.
 - Always handle errors, use `createError` for API errors
 - No `any` types
 
+## MCP Tools Quick Reference
+- **SQLite** — query `data/accounts.sqlite` directly instead of writing scripts. E.g. `SELECT id, limited_until FROM accounts`
+- **GitHub** — create issues, PRs, search code. Use instead of `gh` CLI
+- **Context7** — look up library docs when unsure about APIs
+- **Memory** — `memory_search` before work, `memory_save` after decisions
+- **Skills** — `npx skills find <query>` to discover installable agent skills
+- **CIE** — semantic code search (disabled by default, needs LM Studio + WSL)
+
 ## Service URLs (standardized)
 
 | Service | From Host | From Docker |

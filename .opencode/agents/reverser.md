@@ -4,6 +4,7 @@ mode: subagent
 tools:
   playwright*: true
   memory*: true
+  sqlite*: true
   write: false
   edit: false
 permission:
@@ -166,6 +167,13 @@ window.Map = class extends _Map {
   }
 };
 ```
+
+## Browser Prep — MANDATORY before AI Studio work
+Before navigating to AI Studio or doing any BotGuard work:
+1. Use SQLite MCP to check cookies exist: `SELECT id, json_extract(creds, '$.cookie') IS NOT NULL as has_cookies FROM accounts LIMIT 1`
+2. Navigate to `https://aistudio.google.com/`
+3. Take a screenshot to verify login state
+4. If redirected to accounts.google.com → cookies expired, notify user
 
 ## Workflow
 
