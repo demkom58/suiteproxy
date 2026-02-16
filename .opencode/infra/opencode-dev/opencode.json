@@ -7,7 +7,7 @@
   "mcp": {
     "playwright": {
       "type": "local",
-      "command": ["npx", "@playwright/mcp@latest", "--browser", "chrome", "--cdp-endpoint", "http://localhost:9222"],
+      "command": ["bunx", "@playwright/mcp@latest", "--browser", "chrome", "--cdp-endpoint", "http://browser:9223"],
       "enabled": true
     },
     "context7": {
@@ -22,12 +22,18 @@
     },
     "memory": {
       "type": "local",
-      "command": ["node", ".opencode/scripts/memory-mcp.mjs"],
+      "command": ["bun", ".opencode/scripts/memory-mcp.mjs"],
+      "environment": {
+        "OPENMEMORY_URL": "http://openmemory:8080"
+      },
       "enabled": true
     },
     "github": {
       "type": "local",
-      "command": ["bunx", "-y", "@modelcontextprotocol/server-github@latest"],
+      "command": ["github-mcp-server", "stdio"],
+      "environment": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "{env:GITHUB_PAT}"
+      },
       "enabled": true
     },
     "sqlite": {
@@ -37,8 +43,8 @@
     },
     "cie": {
       "type": "local",
-      "command": ["wsl", "-e", "/usr/local/bin/cie", "--mcp"],
-      "enabled": false
+      "command": ["cie", "--mcp"],
+      "enabled": true
     }
   },
 
@@ -64,7 +70,8 @@
       "docker *": "ask",
       "rm *": "ask",
       "git push*": "ask",
-      "git commit*": "ask"
+      "git commit*": "ask",
+      "cie *": "allow"
     },
     "webfetch": "allow"
   }

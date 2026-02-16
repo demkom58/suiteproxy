@@ -14,13 +14,14 @@
 - **Linting**: ESLint with @nuxt/eslint
 
 ## Agents
-Three agents, focused on what matters for a proxy project:
+Three agents, focused on what matters for a proxy project.
+Agent configs live in `.opencode/infra/opencode-dev/agents/` and are copied to `.opencode/agents/` by the container entrypoint on startup.
 
-| Agent | Role | Files |
-|-------|------|-------|
-| **build** (primary) | Full-stack dev — writes code, runs commands | `build.md` |
-| **reverser** | Browser automation + reverse engineering via CDP | `reverser.md` |
-| **reviewer** | Code review — read-only, no file changes | `reviewer.md` |
+| Agent | Role | Source |
+|-------|------|--------|
+| **build** (primary) | Full-stack dev — writes code, runs commands | `agents/build.md` |
+| **reverser** | Browser automation + reverse engineering via CDP | `agents/reverser.md` |
+| **reviewer** | Code review — read-only, no file changes | `agents/reviewer.md` |
 
 ## Build & Dev Commands
 ```bash
@@ -42,24 +43,31 @@ bunx eslint --fix .            # Auto-fix linting issues
 
 ## Service URLs
 
-| Service | From Host | From Docker | Purpose |
-|---------|-----------|-------------|---------|
-| Nuxt dev server | `http://localhost:3000` | `http://host.docker.internal:3000` | The app |
+| Service | From Host | From Container | Purpose |
+|---------|-----------|----------------|---------|
+| OpenCode Web UI | `http://localhost:4096` | N/A | AI coding agent interface |
+| Nuxt dev server | `http://localhost:3000` | `http://localhost:3000` | The app (runs inside container) |
 | Edge Browser GUI | `http://localhost:3100` | N/A | Visual browser debugging |
-| Edge CDP | `http://localhost:9222` | N/A | Playwright automation |
+| Edge Browser CDP | `http://localhost:9222` | `http://browser:9223` | Playwright automation |
 | OpenMemory API | `http://localhost:8787` | `http://openmemory:8080` | Memory API + Dashboard |
+| LM Studio | `http://127.0.0.1:1234/v1` | `http://host.docker.internal:1234/v1` | Embeddings & LLM for CIE |
 
-**Important**: Nuxt must listen on `0.0.0.0` for Docker containers to reach it.
-Start with: `bun run dev --host 0.0.0.0`
+**Important**: Nuxt runs inside the `opencode-dev` container and listens on `0.0.0.0`.
+Start with: `bun --bun run dev --host 0.0.0.0`
 
 ## Infrastructure & Services
 ```bash
-# Docker Services
-docker compose -f .opencode/infra/docker-compose.yml up -d     # Start services
+# First time: create .opencode/infra/.env from .env.example with your API keys
+# Start everything:
+docker compose -f .opencode/infra/docker-compose.yml --env-file .opencode/infra/.env up -d --build
+
+# Other commands:
 docker compose -f .opencode/infra/docker-compose.yml down       # Stop services
 docker compose -f .opencode/infra/docker-compose.yml logs -f    # View logs
 
 # Services:
+# - opencode-dev — dev container with OpenCode, Bun, CIE, all MCP tools
+#     Web UI: http://localhost:4096 | Nuxt: http://localhost:3000
 # - Microsoft Edge (linuxserver/msedge) — real desktop browser, better stealth
 #     GUI: http://localhost:3100 | CDP: localhost:9222
 # - OpenMemory — persistent memory engine with built-in dashboard
@@ -96,6 +104,9 @@ app/pages/                     # Nuxt pages (file-based routing)
 app/components/                # Vue components
 composables/                   # Vue composables (use[Name].ts)
 aistuido-docs/                 # Reference docs for reverse engineering
+.opencode/infra/               # Docker infrastructure (compose, Dockerfiles)
+.opencode/infra/opencode-dev/  # Dev container config (agents, rules, Dockerfile)
+.opencode/scripts/             # MCP bridge scripts
 ```
 
 ### TypeScript Guidelines
@@ -160,10 +171,14 @@ chore: update dependencies
 ```
 
 ## MCP Tools Integration
-- **Playwright**: Browser automation via CDP (connects to Edge Docker, port 9222)
-- **Context7**: Library documentation lookup
-- **GitHub Grep**: Code search across GitHub
-- **Memory**: Persistent storage via OpenMemory (Docker, port 8787)
+All MCP servers run inside the `opencode-dev` container using `bun`/`bunx`:
+- **Playwright**: Browser automation via CDP (connects to Edge at `browser:9223`)
+- **Context7**: Library documentation lookup (remote)
+- **GitHub Grep**: Code search across GitHub (remote)
+- **Memory**: Persistent storage via OpenMemory (`openmemory:8080`)
+- **GitHub**: Issues, PRs, code search (native `github-mcp-server` binary)
+- **SQLite**: Direct SQL access to `data/accounts.sqlite`
+- **CIE**: Semantic code search, call graphs (native binary, needs LM Studio on host)
 
 ## Debugging & Development
 - **Nitro Preset**: Configured for `bun` runtime

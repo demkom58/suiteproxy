@@ -15,7 +15,7 @@ const USER = process.env.OPENMEMORY_USER || "opencode-agent";
 const tools = [
   {
     name: "memory_save",
-    description: "Save a memory to persistent storage. Survives across sessions. Use for: architectural decisions, resolved bugs, discovered patterns, reverse-engineering findings, user preferences. Dashboard: http://localhost:8788",
+    description: "Save a memory to persistent storage. Survives across sessions. Use for: architectural decisions, resolved bugs, discovered patterns, reverse-engineering findings, user preferences. Dashboard: http://localhost:8787",
     inputSchema: {
       type: "object",
       properties: {
