@@ -5,7 +5,7 @@ services:
     container_name: opencode-dev
     ports:
       - "4096:4096"   # OpenCode Web UI
-      - "3000:3000"   # Nuxt dev server
+      - "43000:3000"   # Nuxt dev server
     volumes:
       # Mount project from host (rw) — edits sync both ways
       - ../../:/app
