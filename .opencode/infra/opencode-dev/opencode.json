@@ -7,7 +7,7 @@
   "mcp": {
     "playwright": {
       "type": "local",
-      "command": ["bunx", "@playwright/mcp@latest", "--browser", "chrome", "--cdp-endpoint", "http://browser:9223"],
+      "command": ["bunx", "@playwright/mcp@latest", "--browser", "firefox"],
       "enabled": true
     },
     "context7": {
@@ -66,9 +66,9 @@
       "head *": "allow",
       "tail *": "allow",
       "wc *": "allow",
-      "curl *": "ask",
-      "docker *": "ask",
-      "rm *": "ask",
+      "curl *": "allow",
+      "docker *": "allow",
+      "rm *": "allow",
       "git push*": "ask",
       "git commit*": "ask",
       "cie *": "allow"

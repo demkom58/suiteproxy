@@ -1,3 +1,4 @@
+/// <reference types="bun-types" />
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 

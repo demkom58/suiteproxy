@@ -40,6 +40,3 @@ data/
 
 # CIE index data
 .cie/data/
-
-# Docker env (has secrets)
-.opencode/infra/.env

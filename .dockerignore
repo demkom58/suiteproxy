@@ -1,0 +1,35 @@
+# Dependencies (installed inside container)
+node_modules
+
+# Build outputs
+.output
+.nuxt
+.nitro
+.cache
+dist
+
+# Data (mounted as volume)
+data
+
+# Dev tooling
+.opencode
+.cie
+.git
+.DS_Store
+.fleet
+.idea
+
+# Docs (not needed in production)
+aistuido-docs
+AGENTS.md
+README.md
+
+# Env files (passed via docker-compose)
+.env
+.env.*
+
+# Logs
+logs
+*.log
+*.joined.txt
+**unified.md

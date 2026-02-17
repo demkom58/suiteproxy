@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      width: 340px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      padding: 20px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+    }
+    .logo {
+      font-size: 18px;
+      font-weight: 900;
+      letter-spacing: -0.5px;
+      font-style: italic;
+    }
+    .logo span { color: #3b82f6; }
+    .version {
+      font-size: 10px;
+      color: #475569;
+      font-family: monospace;
+    }
+    
+    .section {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 14px;
+      margin-bottom: 12px;
+    }
+    .section-title {
+      font-size: 10px;
+      font-weight: 700;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 1.5px;
+      margin-bottom: 8px;
+    }
+    
+    .input-group {
+      display: flex;
+      gap: 6px;
+    }
+    input {
+      flex: 1;
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      padding: 8px 10px;
+      color: #e2e8f0;
+      font-size: 12px;
+      font-family: monospace;
+      outline: none;
+    }
+    input:focus { border-color: #3b82f6; }
+    
+    .btn {
+      padding: 8px 14px;
+      border: none;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn:active { transform: scale(0.97); }
+    .btn-primary {
+      background: #3b82f6;
+      color: white;
+    }
+    .btn-primary:hover { background: #2563eb; }
+    .btn-save {
+      background: #334155;
+      color: #94a3b8;
+    }
+    .btn-save:hover { background: #475569; }
+    
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .status-dot.connected { background: #10b981; }
+    .status-dot.disconnected { background: #ef4444; }
+    .status-dot.unknown { background: #64748b; }
+    
+    .info-row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 11px;
+      padding: 4px 0;
+      color: #94a3b8;
+    }
+    .info-row .label { color: #64748b; }
+    .info-row .value { font-family: monospace; }
+    
+    .divider {
+      border: none;
+      border-top: 1px solid #1e293b;
+      margin: 8px 0;
+    }
+    
+    .footer {
+      text-align: center;
+      font-size: 10px;
+      color: #334155;
+      margin-top: 8px;
+      font-family: monospace;
+    }
+
+    .msg {
+      font-size: 11px;
+      padding: 6px 10px;
+      border-radius: 6px;
+      margin-top: 8px;
+      display: none;
+    }
+    .msg.success {
+      display: block;
+      background: #10b98120;
+      color: #10b981;
+      border: 1px solid #10b98140;
+    }
+    .msg.error {
+      display: block;
+      background: #ef444420;
+      color: #ef4444;
+      border: 1px solid #ef444440;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="logo">SUITE<span>PROXY</span></div>
+    <div class="version">v1.0</div>
+  </div>
+  
+  <!-- Proxy URL Config -->
+  <div class="section">
+    <div class="section-title">Proxy Server</div>
+    <div class="input-group">
+      <input type="text" id="proxyUrl" placeholder="http://localhost:3000">
+      <button class="btn btn-save" id="saveBtn">Save</button>
+      <button class="btn btn-primary" id="testBtn">Test</button>
+    </div>
+    <div id="testMsg" class="msg"></div>
+  </div>
+  
+  <!-- Connection Status -->
+  <div class="section">
+    <div class="section-title">Status</div>
+    <div class="status">
+      <div class="status-dot" id="statusDot"></div>
+      <span id="statusText">Checking...</span>
+    </div>
+    <hr class="divider">
+    <div class="info-row">
+      <span class="label">Last Sync</span>
+      <span class="value" id="lastSync">Never</span>
+    </div>
+    <div class="info-row">
+      <span class="label">Account</span>
+      <span class="value" id="lastEmail">—</span>
+    </div>
+    <div class="info-row">
+      <span class="label">Cookies</span>
+      <span class="value" id="cookieCount">—</span>
+    </div>
+  </div>
+  
+  <!-- Instructions -->
+  <div class="section">
+    <div class="section-title">How to Use</div>
+    <div style="font-size: 11px; color: #94a3b8; line-height: 1.6;">
+      1. Set your proxy URL above<br>
+      2. Open <a href="https://aistudio.google.com" target="_blank" style="color: #3b82f6;">AI Studio</a><br>
+      3. Click the blue <b>&#9889; SYNC</b> button on the page
+    </div>
+  </div>
+  
+  <div class="footer">
+    HttpOnly cookies captured automatically
+  </div>
+  
+  <script src="popup.js"></script>
+</body>
+</html>

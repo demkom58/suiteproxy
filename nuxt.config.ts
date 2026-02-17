@@ -32,11 +32,12 @@ export default defineNuxtConfig({
   typescript: {
     strict: true,
     includeWorkspace: true,
-    hoist: ['puppeteer', 'bun'],
+    hoist: ['bun'],
     tsConfig: {
       compilerOptions: {
         lib: ['ESNext', 'DOM', 'DOM.Iterable']
-      }
+      },
+      exclude: ['../data/**', '../aistuido-docs/**']
     }
   }
 })

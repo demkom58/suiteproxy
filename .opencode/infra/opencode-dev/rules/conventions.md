@@ -41,17 +41,45 @@ Semantic code search, call graph analysis, function discovery. Native Linux bina
 - `cie_grep` — fast literal text search
 
 ### Skills (`find-skills`)
-Use `npx skills find <query>` to discover installable agent skills for specialized tasks.
-Install with `npx skills add <package> -g -y`.
+The Skills CLI (`npx skills`) is the package manager for the open agent skills ecosystem.
+Skills are modular packages that extend agent capabilities with specialized knowledge, workflows, and tools.
+
+**Commands:**
+- `npx skills find <query>` — search for skills by keyword (e.g. `npx skills find react performance`)
+- `npx skills add <owner/repo@skill> -g -y` — install a skill globally (no prompts)
+- `npx skills add <github-url> --skill <name>` — install from GitHub URL
+- `npx skills check` — check for skill updates
+- `npx skills update` — update all installed skills
+
+**Browse skills at:** https://skills.sh/
+
+**When to use:**
+- When tackling an unfamiliar domain (design, testing, deployment, etc.)
+- When a task is common enough that a community skill likely exists
+- When you need specialized knowledge beyond your training (framework best practices, security audits, etc.)
+
+**Example workflow:**
+```bash
+# User asks about React performance
+npx skills find react performance
+# Found: vercel-labs/agent-skills@vercel-react-best-practices
+npx skills add vercel-labs/agent-skills@vercel-react-best-practices -g -y
+```
 
 ### Existing Tools (unchanged)
-- **Playwright** — browser automation via Edge CDP at `browser:9222`
+- **Playwright** — browser automation via Camoufox (stealth Firefox, local, `DISPLAY=:99`)
 - **Context7** — library documentation lookup
 - **GitHub Grep** — search code across public GitHub repos
 - **Memory** — persistent storage via OpenMemory at `openmemory:8080`
 
+## Browser Environment
+- **Camoufox** (stealth Firefox) runs locally inside this container
+- **Xvfb** provides virtual display on `:99` (`DISPLAY=:99` set in environment)
+- **Playwright MCP** uses `--browser firefox` — launches Camoufox directly
+- No external browser container needed
+
 ## Browser Prep Protocol
-Before any CDP/Playwright work with AI Studio:
+Before any Playwright work with AI Studio:
 1. Use SQLite MCP to verify account exists: `SELECT id FROM accounts LIMIT 1`
 2. Navigate to `https://aistudio.google.com/` via Playwright
 3. If redirected to login, cookies may be expired — notify user
@@ -61,10 +89,8 @@ Before any CDP/Playwright work with AI Studio:
 | Service | URL | Notes |
 |---------|-----|-------|
 | Nuxt dev server | `http://localhost:3000` | Runs in this container |
-| Edge Browser CDP | `http://browser:9222` | Docker service name |
 | OpenMemory API | `http://openmemory:8080` | Docker service name |
 | LM Studio | `http://host.docker.internal:1234/v1` | On host machine |
-| Edge GUI | Host only: `http://localhost:3100` | |
 | OpenMemory Dashboard | Host only: `http://localhost:8787` | |
 
 ## Code Patterns
@@ -75,9 +101,8 @@ Before any CDP/Playwright work with AI Studio:
 
 ## Proxy Context
 Primary project: AI Studio (MakerSuite) proxy. Key concerns:
-- Request interception/forwarding
-- Auth token management
-- BotGuard token generation
+- Request interception/forwarding via Camoufox browser automation
+- Auth token management (cookies from extension)
 - Response streaming
 - Rate limiting / queuing
 - Error recovery
@@ -85,6 +110,5 @@ Primary project: AI Studio (MakerSuite) proxy. Key concerns:
 
 ## Docker Services
 All services are on the same Docker network:
-- **Edge Browser**: `browser:9222` (CDP) — real desktop browser, better stealth
 - **OpenMemory**: `openmemory:8080` (API + Dashboard)
-- **This container**: `opencode-dev` — Nuxt on :3000, OpenCode Web on :4096
+- **This container**: `opencode-dev` — Nuxt on :3000, OpenCode Web on :4096, Camoufox + Xvfb

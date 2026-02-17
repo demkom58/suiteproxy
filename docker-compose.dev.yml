@@ -1,0 +1,36 @@
+# SuiteProxy — Development deployment (hot reload)
+#
+# Usage:
+#   docker compose -f docker-compose.dev.yml up -d --build
+#
+# Mounts source code for hot reload. Camoufox runs inside with Xvfb.
+# Use this on Windows where Bun + Playwright doesn't work natively.
+#
+services:
+  suiteproxy-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: suiteproxy-dev
+    ports:
+      - "3000:3000"
+    volumes:
+      # Mount source for hot reload
+      - .:/app
+      # Separate volume for node_modules (avoids Win/Linux binary conflicts)
+      - node_modules:/app/node_modules
+      # Persist bun cache
+      - bun_cache:/root/.bun
+      # Persist Camoufox binary (~260MB — avoid re-downloading)
+      - camoufox_cache:/root/.cache/camoufox
+    environment:
+      - DISPLAY=:99
+      - PROXY_API_KEY=${PROXY_API_KEY:-}
+      - NODE_ENV=development
+    shm_size: "2gb"
+    restart: unless-stopped
+
+volumes:
+  node_modules:
+  bun_cache:
+  camoufox_cache:

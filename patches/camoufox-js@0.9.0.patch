@@ -1,0 +1,50 @@
+diff --git a/dist/__main__.js b/dist/__main__.js
+index 2d8f343b33ed663a572fdba306ba08d0ec0d63bf..c130024a6416ab61d99e8d2b790cdf877939fdf3 100755
+--- a/dist/__main__.js
++++ b/dist/__main__.js
+@@ -54,7 +54,19 @@ class CamoufoxUpdate extends CamoufoxFetcher {
+         if (!existsSync(INSTALL_DIR)) {
+             return false;
+         }
+-        await rmSync(INSTALL_DIR, { recursive: true, force: true });
++        try {
++            rmSync(INSTALL_DIR, { recursive: true, force: true });
++        } catch (e) {
++            if (e.code === 'EBUSY') {
++                const path = await import("node:path");
++                const fs = await import("node:fs");
++                for (const entry of fs.readdirSync(INSTALL_DIR)) {
++                    fs.rmSync(path.join(INSTALL_DIR.toString(), entry), { recursive: true, force: true });
++                }
++            } else {
++                throw e;
++            }
++        }
+         console.log("Camoufox binaries removed!");
+         return true;
+     }
+diff --git a/dist/pkgman.js b/dist/pkgman.js
+index b87aacb0221574c78cb835508ff54a7a1c734275..7970406130c10c47bfb7bab7ae3c10668496851f 100644
+--- a/dist/pkgman.js
++++ b/dist/pkgman.js
+@@ -187,7 +187,19 @@ export class CamoufoxFetcher extends GitHubDownloader {
+     }
+     static cleanup() {
+         if (fs.existsSync(INSTALL_DIR)) {
+-            fs.rmSync(INSTALL_DIR, { recursive: true });
++            try {
++                fs.rmSync(INSTALL_DIR, { recursive: true });
++            } catch (e) {
++                // EBUSY: directory is a Docker volume mount point — can't remove it.
++                // Instead, remove all contents inside it.
++                if (e.code === 'EBUSY') {
++                    for (const entry of fs.readdirSync(INSTALL_DIR)) {
++                        fs.rmSync(path.join(INSTALL_DIR.toString(), entry), { recursive: true, force: true });
++                    }
++                } else {
++                    throw e;
++                }
++            }
+             return true;
+         }
+         return false;

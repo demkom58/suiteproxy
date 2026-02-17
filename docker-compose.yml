@@ -1,0 +1,25 @@
+# SuiteProxy — Production deployment
+#
+# Usage:
+#   docker compose up -d --build
+#
+# The app runs Camoufox (stealth Firefox) inside the container with Xvfb.
+# This works on Windows, macOS, and Linux — no native browser needed.
+#
+# Required env vars (create .env file):
+#   PROXY_API_KEY=your-secret-key     # API authentication
+#
+services:
+  suiteproxy:
+    build: .
+    container_name: suiteproxy
+    ports:
+      - "3000:3000"
+    volumes:
+      # Persist database and error snapshots
+      - ./data:/app/data
+    environment:
+      - PROXY_API_KEY=${PROXY_API_KEY:-}
+      - NODE_ENV=production
+    shm_size: "2gb"  # Firefox needs shared memory
+    restart: unless-stopped

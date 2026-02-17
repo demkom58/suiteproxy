@@ -179,6 +179,7 @@ All MCP servers run inside the `opencode-dev` container using `bun`/`bunx`:
 - **GitHub**: Issues, PRs, code search (native `github-mcp-server` binary)
 - **SQLite**: Direct SQL access to `data/accounts.sqlite`
 - **CIE**: Semantic code search, call graphs (native binary, needs LM Studio on host)
+- **Skills**: Agent skill discovery & installation via `npx skills` (browse at https://skills.sh/)
 
 ## Debugging & Development
 - **Nitro Preset**: Configured for `bun` runtime

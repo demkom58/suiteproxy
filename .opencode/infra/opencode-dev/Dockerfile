@@ -2,10 +2,22 @@
 # Base: oven/bun (Debian) — bun handles all JS/TS/MJS natively, no Node needed
 FROM oven/bun:1.3-debian AS base
 
-# System dependencies
+# System dependencies (dev tools + Camoufox/Firefox GUI libs + Xvfb)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Dev tools
     git curl jq sqlite3 procps lsof net-tools ca-certificates \
     unzip xz-utils \
+    # Virtual framebuffer (Camoufox needs a display)
+    xvfb \
+    # GTK3 + GUI libs for Firefox/Camoufox
+    libgtk-3-0 libdbus-glib-1-2 libasound2 \
+    libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 libxtst6 \
+    libpango-1.0-0 libcairo2 libatk1.0-0 libatk-bridge2.0-0 \
+    libcups2 libdrm2 libgbm1 libxshmfence1 \
+    # D-Bus (Firefox IPC)
+    dbus dbus-x11 \
+    # Fonts
+    fonts-liberation fonts-noto-core \
   && rm -rf /var/lib/apt/lists/*
 
 # --- Tool binaries ---
