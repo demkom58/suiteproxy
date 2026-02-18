@@ -103,7 +103,6 @@ shared/types.ts                # Shared types between client/server
 app/pages/                     # Nuxt pages (file-based routing)
 app/components/                # Vue components
 composables/                   # Vue composables (use[Name].ts)
-aistuido-docs/                 # Reference docs for reverse engineering
 .opencode/infra/               # Docker infrastructure (compose, Dockerfiles)
 .opencode/infra/opencode-dev/  # Dev container config (agents, rules, Dockerfile)
 .opencode/scripts/             # MCP bridge scripts
