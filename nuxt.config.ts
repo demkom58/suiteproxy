@@ -1,43 +1,59 @@
 // https://nuxt.com/docs/api/configuration/nuxt-config
+import { existsSync } from 'node:fs'
+const isDocker = !!process.env.DOCKER || !!process.env.container || existsSync('/.dockerenv')
+
 export default defineNuxtConfig({
   compatibilityDate: '2025-07-15',
-  devtools: { enabled: true },
+
+  devtools: { enabled: !!process.env.NUXT_DEVTOOLS },
+
+  // ── Nitro (server) ───────────────────────────────────────────────────
   nitro: {
-    preset: "bun", 
+    preset: 'bun',
     watchOptions: {
-      ignored: ['**/accounts.sqlite*']
+      ignored: ['**/accounts.sqlite*'],
     },
     typescript: {
       tsConfig: {
         compilerOptions: {
-          lib: ["ESNext", "DOM", "DOM.Iterable"]
-        }
-      }
-    }
+          lib: ['ESNext', 'DOM', 'DOM.Iterable'],
+        },
+      },
+    },
   },
+
+  // ── Vite ─────────────────────────────────────────────────────────────
+  vite: {
+    cacheDir: '.nuxt/.vite',
+
+    optimizeDeps: {
+      include: ['vue', 'vue-router'],
+    },
+
+    server: {
+      ...(isDocker && {
+        watch: {
+          usePolling: true,
+          interval: 2000,
+        },
+      }),
+    },
+  },
+
+  // ── Modules ──────────────────────────────
   modules: [
     '@nuxt/eslint',
-    '@nuxt/fonts',
-    '@nuxt/hints',
-    '@nuxt/icon',
-    '@nuxt/image',
-    '@nuxt/scripts',
-    '@nuxt/test-utils',
     '@nuxtjs/tailwindcss',
-    '@pinia/nuxt',
-    '@pinia/colada-nuxt',
-    '@primevue/nuxt-module',
-    '@vueuse/nuxt'
   ],
+
+  // ── TypeScript ───────────────────────────────────────────────────────
   typescript: {
     strict: true,
-    includeWorkspace: true,
-    hoist: ['bun'],
     tsConfig: {
       compilerOptions: {
-        lib: ['ESNext', 'DOM', 'DOM.Iterable']
+        lib: ['ESNext', 'DOM', 'DOM.Iterable'],
       },
-      exclude: ['../data/**', '../aistuido-docs/**']
-    }
-  }
+      exclude: ['../data/**'],
+    },
+  },
 })

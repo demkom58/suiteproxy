@@ -5,6 +5,15 @@ import { defineVitestProject } from '@nuxt/test-utils/config'
 export default defineConfig({
   test: {
     projects: [
+      // Pure unit tests (no Nuxt environment needed)
+      {
+        test: {
+          name: 'unit',
+          include: ['test/unit/*.{test,spec}.ts'],
+          environment: 'node',
+        },
+      },
+      // Nuxt integration tests
       await defineVitestProject({
         test: {
           name: 'nuxt',
