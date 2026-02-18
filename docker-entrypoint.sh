@@ -42,4 +42,4 @@ mkdir -p /app/data/snapshots
 
 # ── Start SuiteProxy ───────────────────────────────────────────────────
 echo "[entrypoint] Starting SuiteProxy..."
-exec bun run .output/server/index.mjs
+exec bun --bun run .output/server/index.mjs

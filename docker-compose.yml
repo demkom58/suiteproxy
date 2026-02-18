@@ -16,10 +16,14 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      # Persist database and error snapshots
-      - ./data:/app/data
+      - ./data:/app/data # Persist database and error snapshots
     environment:
+      - DISPLAY=:99
+      - DOCKER=1
       - PROXY_API_KEY=${PROXY_API_KEY:-}
       - NODE_ENV=production
-    shm_size: "2gb"  # Firefox needs shared memory
+    init: true
+    stdin_open: true
+    tty: true
+    shm_size: "2gb" # Firefox needs shared memory
     restart: unless-stopped
