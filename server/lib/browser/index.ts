@@ -15,6 +15,7 @@ import type { BrowserState, StorageState } from './types';
 import { cookieToStorageState } from './auth-converter';
 import { AI_STUDIO_NEW_CHAT, AI_STUDIO_URL_PATTERN, PROMPT_TEXTAREA, INPUT_WRAPPER } from './selectors';
 import { AuthenticationError, BrowserNotInitializedError, PageNotReadyError } from './errors';
+import { installInterceptorOnContext, resetInterceptorState } from './network-interceptor';
 
 // ── Global state (survives hot reloads) ─────────────────────────────────
 declare global {
@@ -117,6 +118,9 @@ export async function closeBrowser(): Promise<void> {
   state.isReady = false;
   state.currentAccountId = null;
   state.currentModel = null;
+
+  // Reset interceptor state (route handler references, buffers)
+  resetInterceptorState();
 
   if (state.page) {
     try { await state.page.close(); } catch { /* ignore */ }
@@ -237,8 +241,22 @@ async function launchAndNavigate(
     state.context = context;
     console.log(`[Browser] Context created with ${storageState.cookies.length} cookies`);
 
+    // Install route-based network interceptor on context
+    // This uses page.route() at the Playwright protocol level — catches ALL requests
+    // regardless of transport (XHR, fetch, gRPC-web Rv polyfill, etc.)
+    await installInterceptorOnContext(context);
+
     // Create page and navigate to AI Studio
     const page = await context.newPage();
+
+    // Forward browser console error messages to Node.js for debugging
+    page.on('console', (msg) => {
+      const type = msg.type();
+      const text = msg.text();
+      if (type === 'error') {
+        console.log(`[BrowserConsole:${type}] ${text}`);
+      }
+    });
 
     console.log(`[Browser] Navigating to ${AI_STUDIO_NEW_CHAT}...`);
     await page.goto(AI_STUDIO_NEW_CHAT, {
@@ -365,6 +383,8 @@ async function enableTempChat(page: Page): Promise<void> {
 export { PageController } from './page-controller';
 export { switchModel } from './model-switcher';
 export { saveErrorSnapshot } from './snapshots';
+export { installInterceptor, installInterceptorOnContext, startCapture, endCapture, consumeChunks, consumeStreamingChunks, hasRouteFired, resetInterceptorState } from './network-interceptor';
+export type { StreamChunk } from './network-interceptor';
 export type { BrowserState, RequestContext, QueueResult, ParsedModel, ThinkingDirective } from './types';
 export {
   BrowserAutomationError,

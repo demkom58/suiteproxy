@@ -248,11 +248,18 @@ async function executeRequest(ctx: RequestContext): Promise<QueueResult> {
   // Adjust parameters
   await controller.adjustParameters(ctx);
 
+  // Prepare network capture for faster response extraction (non-streaming mode)
+  try {
+    await controller.prepareNetworkCapture('non-streaming');
+  } catch (error) {
+    console.warn(`[Queue] Network capture setup failed for non-streaming, will use DOM:`, error);
+  }
+
   // Submit prompt
   await controller.submitPrompt(ctx.prompt);
 
-  // Get response
-  const result = await controller.getResponse();
+  // Get response (network interception with DOM fallback)
+  const result = await controller.getResponseViaNetwork();
 
   // Ensure generation is fully stopped before next request
   await controller.ensureGenerationStopped();
@@ -269,11 +276,21 @@ async function executeStreamingRequest(
 
   await controller.clearChat();
   await controller.adjustParameters(ctx);
+
+  // Prepare network capture BEFORE submitting the prompt (streaming mode)
+  // This installs the route interceptor + in-browser XHR patches for real-time streaming
+  try {
+    await controller.prepareNetworkCapture('streaming');
+    console.log(`[Queue] executeStreamingRequest: network capture ready (streaming mode) for ${ctx.reqId}`);
+  } catch (error) {
+    console.warn(`[Queue] executeStreamingRequest: network capture setup failed, will use DOM polling:`, error);
+  }
+
   await controller.submitPrompt(ctx.prompt);
 
-  console.log(`[Queue] executeStreamingRequest: starting pollResponse for ${ctx.reqId}`);
-  // Return the polling generator — caller consumes it
-  return controller.pollResponse(abortSignal);
+  console.log(`[Queue] executeStreamingRequest: starting stream for ${ctx.reqId}`);
+  // Use network-intercepted streaming (with DOM polling fallback built-in)
+  return controller.streamViaNetwork(abortSignal);
 }
 
 /**

@@ -14,6 +14,14 @@ import type { Page, Locator } from 'playwright-core';
 import type { RequestContext, ThinkingDirective, ModelCategory, ThinkingLevel, QueueResult } from './types';
 import { RateLimitError } from './errors';
 import * as S from './selectors';
+import {
+  installInterceptor,
+  startCapture,
+  endCapture,
+  consumeChunks,
+  consumeStreamingChunks,
+  isCaptureActive,
+} from './network-interceptor';
 
 // ── Timeouts ────────────────────────────────────────────────────────────
 const RESPONSE_TIMEOUT_MS = 300_000; // 5 min
@@ -233,6 +241,138 @@ export class PageController {
     // Timeout — yield what we have
     console.warn(`[PageController:${this.reqId}] pollResponse: timeout after ${totalPolls} polls`);
     yield { delta: '', done: true };
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  // NETWORK-INTERCEPTED STREAMING (preferred — real-time)
+  // ══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Prepare the network interceptor BEFORE submitting the prompt.
+   * Must be called before submitPrompt() for network-based streaming.
+   * @param mode - 'streaming' enables in-browser XHR patches for real-time chunks.
+   *               'non-streaming' only uses response.body() for the full result.
+   */
+  async prepareNetworkCapture(mode: 'streaming' | 'non-streaming' = 'non-streaming'): Promise<void> {
+    await installInterceptor(this.page);
+    await startCapture(this.page, this.reqId, mode);
+    console.log(`[PageController:${this.reqId}] Network capture prepared (mode=${mode})`);
+  }
+
+  /**
+   * Stream response via network interception (v3 hybrid).
+   * Uses consumeStreamingChunks() which polls in-browser XHR data for real-time
+   * streaming, with automatic fallback to response.body() burst if XHR patches
+   * don't capture the data. Falls back to DOM polling only if neither fires.
+   */
+  async *streamViaNetwork(abortSignal?: AbortSignal): AsyncGenerator<{ delta: string; done: boolean }> {
+    if (!(await isCaptureActive(this.page))) {
+      console.warn(`[PageController:${this.reqId}] No active capture, falling back to DOM polling`);
+      yield* this.pollResponse(abortSignal);
+      return;
+    }
+
+    console.log(`[PageController:${this.reqId}] Streaming via hybrid interception (XHR + route fallback)`);
+
+    let gotAnyData = false;
+
+    try {
+      for await (const chunk of consumeStreamingChunks(this.page, this.reqId, abortSignal)) {
+        if (abortSignal?.aborted) {
+          yield { delta: '', done: true };
+          return;
+        }
+
+        if (chunk.error) {
+          // 'no_data' = neither XHR patches nor response.body() delivered, fall back to DOM polling
+          if (!gotAnyData) {
+            console.log(`[PageController:${this.reqId}] Network interception didn't fire, falling back to DOM polling (${chunk.error})`);
+            await endCapture(this.page);
+            yield* this.pollResponse(abortSignal);
+            return;
+          }
+          console.error(`[PageController:${this.reqId}] Stream error: ${chunk.error}`);
+          yield { delta: `\n\n[Error: ${chunk.error}]`, done: true };
+          return;
+        }
+
+        if (chunk.text) {
+          gotAnyData = true;
+          yield { delta: chunk.text, done: false };
+        }
+
+        if (chunk.thinking) {
+          gotAnyData = true;
+          // Yield thinking text as a separate delta (prefixed for downstream handling)
+          yield { delta: chunk.thinking, done: false };
+        }
+
+        if (chunk.done) {
+          yield { delta: '', done: true };
+          return;
+        }
+      }
+    } finally {
+      await endCapture(this.page);
+    }
+
+    // If we exited without a done signal
+    if (gotAnyData) {
+      yield { delta: '', done: true };
+    }
+  }
+
+  /**
+   * Get response via network interception (non-streaming).
+   * With route-based interception, the response is captured at the network level
+   * and parsed server-side. Falls back to DOM extraction only if the route doesn't fire.
+   */
+  async getResponseViaNetwork(): Promise<QueueResult> {
+    if (!(await isCaptureActive(this.page))) {
+      console.warn(`[PageController:${this.reqId}] No active capture, using DOM extraction`);
+      return this.getResponse();
+    }
+
+    console.log(`[PageController:${this.reqId}] Getting response via route interception`);
+
+    let networkText = '';
+    let networkThinking = '';
+
+    try {
+      for await (const chunk of consumeChunks(this.page, this.reqId)) {
+        if (chunk.error) {
+          if (chunk.error === 'no_data') {
+            // Route didn't fire — fall back to DOM extraction
+            console.log(`[PageController:${this.reqId}] Route didn't fire, falling back to DOM extraction`);
+            await endCapture(this.page);
+            return this.getResponse();
+          }
+          console.error(`[PageController:${this.reqId}] Network error: ${chunk.error}`);
+          await endCapture(this.page);
+          throw new Error(`Network interception error: ${chunk.error}`);
+        }
+
+        if (chunk.text) networkText += chunk.text;
+        if (chunk.thinking) networkThinking += chunk.thinking;
+
+        if (chunk.done) break;
+      }
+    } finally {
+      await endCapture(this.page);
+    }
+
+    if (networkText) {
+      console.log(`[PageController:${this.reqId}] Got response via route (${networkText.length} chars)`);
+      return {
+        text: networkText,
+        finishReason: 'stop',
+        thinkingText: networkThinking || undefined,
+      };
+    }
+
+    // No text from network — fall back to DOM
+    console.warn(`[PageController:${this.reqId}] No text from route, falling back to DOM`);
+    return this.getResponse();
   }
 
   /**
