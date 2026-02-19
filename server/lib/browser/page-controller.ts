@@ -11,7 +11,7 @@
  * - Poll for response completion (for streaming)
  */
 import type { Page, Locator } from 'playwright-core';
-import type { RequestContext, ThinkingDirective, ModelCategory, ThinkingLevel, QueueResult } from './types';
+import type { RequestContext, ThinkingDirective, ModelCategory, ThinkingLevel, QueueResult, StreamDelta } from './types';
 import { RateLimitError } from './errors';
 import * as S from './selectors';
 import {
@@ -167,7 +167,7 @@ export class PageController {
    * Poll for response text incrementally (for streaming).
    * Yields text deltas as they appear on the page.
    */
-  async *pollResponse(abortSignal?: AbortSignal): AsyncGenerator<{ delta: string; done: boolean }> {
+  async *pollResponse(abortSignal?: AbortSignal): AsyncGenerator<StreamDelta> {
     let previousText = '';
     let stableCount = 0; // Counts how many polls text hasn't changed AND textarea is empty
     const STABLE_THRESHOLD = 10; // ~3 seconds at 300ms interval — heuristic completion
@@ -265,7 +265,7 @@ export class PageController {
    * streaming, with automatic fallback to response.body() burst if XHR patches
    * don't capture the data. Falls back to DOM polling only if neither fires.
    */
-  async *streamViaNetwork(abortSignal?: AbortSignal): AsyncGenerator<{ delta: string; done: boolean }> {
+  async *streamViaNetwork(abortSignal?: AbortSignal): AsyncGenerator<StreamDelta> {
     if (!(await isCaptureActive(this.page))) {
       console.warn(`[PageController:${this.reqId}] No active capture, falling back to DOM polling`);
       yield* this.pollResponse(abortSignal);
@@ -296,6 +296,16 @@ export class PageController {
           return;
         }
 
+        if (chunk.images?.length) {
+          gotAnyData = true;
+          yield { delta: '', images: chunk.images, done: false };
+        }
+
+        if (chunk.audioChunks?.length) {
+          gotAnyData = true;
+          yield { delta: '', audioChunks: chunk.audioChunks, done: false };
+        }
+
         if (chunk.text) {
           gotAnyData = true;
           yield { delta: chunk.text, done: false };
@@ -303,8 +313,7 @@ export class PageController {
 
         if (chunk.thinking) {
           gotAnyData = true;
-          // Yield thinking text as a separate delta (prefixed for downstream handling)
-          yield { delta: chunk.thinking, done: false };
+          yield { delta: '', thinking: chunk.thinking, done: false };
         }
 
         if (chunk.done) {
@@ -337,6 +346,8 @@ export class PageController {
 
     let networkText = '';
     let networkThinking = '';
+    const networkImages: Array<{ mimeType: string; data: string }> = [];
+    const networkAudio: Array<{ mimeType: string; data: string }> = [];
 
     try {
       for await (const chunk of consumeChunks(this.page, this.reqId)) {
@@ -354,6 +365,8 @@ export class PageController {
 
         if (chunk.text) networkText += chunk.text;
         if (chunk.thinking) networkThinking += chunk.thinking;
+        if (chunk.images) networkImages.push(...chunk.images);
+        if (chunk.audioChunks) networkAudio.push(...chunk.audioChunks);
 
         if (chunk.done) break;
       }
@@ -361,12 +374,14 @@ export class PageController {
       await endCapture(this.page);
     }
 
-    if (networkText) {
-      console.log(`[PageController:${this.reqId}] Got response via route (${networkText.length} chars)`);
+    if (networkText || networkImages.length > 0 || networkAudio.length > 0) {
+      console.log(`[PageController:${this.reqId}] Got response via route (${networkText.length} chars, ${networkImages.length} images, ${networkAudio.length} audio)`);
       return {
         text: networkText,
         finishReason: 'stop',
         thinkingText: networkThinking || undefined,
+        images: networkImages.length > 0 ? networkImages : undefined,
+        audioChunks: networkAudio.length > 0 ? networkAudio : undefined,
       };
     }
 

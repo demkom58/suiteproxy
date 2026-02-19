@@ -11,9 +11,22 @@
  * - Temperature, top_p, max_tokens, stop sequences
  * - Multi-account with rate limit awareness
  */
-import type { OpenAIChatRequest, OpenAIChatResponse } from '~~/server/types/openai';
-import type { RequestContext } from '~~/server/lib/browser/types';
+import type {
+  OpenAIChatRequest,
+  OpenAIChatResponse,
+  OpenAIContentPart,
+  OpenAIToolDef,
+  OpenAIToolCall,
+} from '~~/server/types/openai';
+import type {
+  RequestContext,
+  InlineImage,
+  GeminiFunctionDeclaration,
+  GeminiFunctionCallResult,
+  ResponseFormatConfig,
+} from '~~/server/lib/browser/types';
 import { enqueueRequest, enqueueStreamingRequest } from '~~/server/lib/browser/queue';
+import { ResponseModality } from '~~/server/types/aistudio';
 import {
   AuthenticationError,
   RateLimitError,
@@ -45,16 +58,25 @@ export default defineEventHandler(async (event) => {
   // Resolve model aliases
   const resolvedModel = MODEL_ALIASES[body.model] ?? body.model;
 
+  // Resolve HTTP image URLs to data URIs so both textarea and injection paths can use them
+  await resolveImageUrls(body.messages);
+
   // Parse messages: separate system instruction, extract images, build prompt
   const parsed = parseMessages(body.messages);
 
-  // Parse tools array for Google Search grounding
-  const enableGoogleSearch = detectGoogleSearchTool(body.tools);
+  // Parse tools array for all tool types
+  const toolConfig = parseTools(body.tools);
+
+  // Parse response_format → structured output config
+  const responseFormat = parseResponseFormat(body.response_format);
 
   // Normalize stop sequences
   const stopSequences = body.stop
     ? (Array.isArray(body.stop) ? body.stop : [body.stop])
     : undefined;
+
+  // Auto-detect image-capable models and enable image output modality
+  const imageCapable = isImageCapableModel(resolvedModel);
 
   // Build request context
   const reqId = `req-${crypto.randomUUID().substring(0, 8)}`;
@@ -62,6 +84,7 @@ export default defineEventHandler(async (event) => {
     reqId,
     model: resolvedModel,
     prompt: parsed.prompt,
+    messages: body.messages,
     systemInstruction: parsed.systemInstruction,
     stream: body.stream ?? false,
     temperature: body.temperature,
@@ -70,7 +93,17 @@ export default defineEventHandler(async (event) => {
     stopSequences,
     reasoningEffort: body.reasoning_effort,
     images: parsed.images.length > 0 ? parsed.images : undefined,
-    enableGoogleSearch: enableGoogleSearch || undefined,
+    enableGoogleSearch: toolConfig.enableGoogleSearch || undefined,
+    enableUrlContext: toolConfig.enableUrlContext || undefined,
+    enableCodeExecution: toolConfig.enableCodeExecution || undefined,
+    functionDeclarations: toolConfig.functionDeclarations.length > 0
+      ? toolConfig.functionDeclarations
+      : undefined,
+    responseFormat,
+    // Enable image output for image-capable models so they can return inline images
+    responseModalities: imageCapable
+      ? [ResponseModality.TEXT, ResponseModality.IMAGE]
+      : undefined,
   };
 
   // ── Streaming Path ──────────────────────────────────────────────────
@@ -128,6 +161,16 @@ export default defineEventHandler(async (event) => {
     const promptTokens = estimateTokens(parsed.prompt);
     const completionTokens = estimateTokens(result.text);
 
+    // Build tool_calls from Gemini function call results (if any)
+    const toolCalls = buildToolCalls(result.functionCalls);
+    const hasToolCalls = toolCalls && toolCalls.length > 0;
+
+    // Build content: string for text-only, array of parts for multimodal (text + images)
+    // When model returns tool_calls, content may be null (model chose to call a function instead of responding)
+    const content = hasToolCalls && !result.text
+      ? null
+      : buildResponseContent(result.text, result.images);
+
     const response: OpenAIChatResponse = {
       id: `chatcmpl-${crypto.randomUUID().replace(/-/g, '').substring(0, 24)}`,
       object: 'chat.completion',
@@ -137,9 +180,13 @@ export default defineEventHandler(async (event) => {
         index: 0,
         message: {
           role: 'assistant',
-          content: result.text,
+          content,
+          // Include thinking/reasoning text if present (DeepSeek/Gemini convention)
+          ...(result.thinkingText ? { reasoning_content: result.thinkingText } : {}),
+          // Include tool_calls when model requests function calls
+          ...(hasToolCalls ? { tool_calls: toolCalls } : {}),
         },
-        finish_reason: result.finishReason,
+        finish_reason: hasToolCalls ? 'tool_calls' : result.finishReason,
       }],
       usage: {
         prompt_tokens: promptTokens,
@@ -252,9 +299,10 @@ function buildPrompt(messages: OpenAIChatRequest['messages']): string {
 
 /**
  * Extract text content from a message's content field.
- * Handles both string content and array content (multimodal).
+ * Handles string, null, and array content (multimodal).
  */
 function extractTextContent(content: OpenAIChatRequest['messages'][0]['content']): string {
+  if (content === null || content === undefined) return '';
   if (typeof content === 'string') return content;
 
   return content
@@ -264,9 +312,59 @@ function extractTextContent(content: OpenAIChatRequest['messages'][0]['content']
 }
 
 /**
- * Extract images from all messages.
- * Supports data: URIs in image_url content parts.
- * Format: data:<mimeType>;base64,<data>
+ * Resolve HTTP/HTTPS image URLs to data: URIs in-place.
+ * Called before message parsing so both the textarea path (ctx.images)
+ * and injection path (ctx.messages → prompt-builder) get the resolved data.
+ *
+ * Fetches images concurrently with a 30s timeout per image.
+ */
+async function resolveImageUrls(messages: OpenAIChatRequest['messages']): Promise<void> {
+  const tasks: Array<{ part: { type: 'image_url'; image_url: { url: string } }; url: string }> = [];
+
+  for (const msg of messages) {
+    if (!msg.content || typeof msg.content === 'string') continue;
+    for (const part of msg.content) {
+      if (part.type !== 'image_url') continue;
+      const url = part.image_url.url;
+      // Only fetch HTTP(S) URLs — data: URIs are already resolved
+      if (url.startsWith('http://') || url.startsWith('https://')) {
+        tasks.push({ part: part as { type: 'image_url'; image_url: { url: string } }, url });
+      }
+    }
+  }
+
+  if (tasks.length === 0) return;
+
+  console.log(`[Completions] Resolving ${tasks.length} HTTP image URL(s)...`);
+
+  const results = await Promise.allSettled(
+    tasks.map(async (task) => {
+      const resp = await fetch(task.url, {
+        signal: AbortSignal.timeout(30_000),
+        headers: { 'Accept': 'image/*' },
+      });
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status} fetching ${task.url.substring(0, 80)}`);
+      }
+      const buffer = await resp.arrayBuffer();
+      const mimeType = resp.headers.get('content-type')?.split(';')[0]?.trim() ?? 'image/png';
+      const base64 = Buffer.from(buffer).toString('base64');
+      // Mutate the message part in-place to a data: URI
+      task.part.image_url.url = `data:${mimeType};base64,${base64}`;
+    }),
+  );
+
+  for (let i = 0; i < results.length; i++) {
+    const result = results[i]!;
+    if (result.status === 'rejected') {
+      console.warn(`[Completions] Failed to fetch image: ${result.reason}`);
+    }
+  }
+}
+
+/**
+ * Extract images from all messages (flat array for textarea path's uploadImages).
+ * By this point, HTTP URLs have already been resolved to data: URIs by resolveImageUrls().
  */
 function extractImages(
   messages: OpenAIChatRequest['messages'],
@@ -274,7 +372,7 @@ function extractImages(
   const images: Array<{ mimeType: string; data: string }> = [];
 
   for (const msg of messages) {
-    if (typeof msg.content === 'string') continue;
+    if (!msg.content || typeof msg.content === 'string') continue;
 
     for (const part of msg.content) {
       if (part.type !== 'image_url') continue;
@@ -288,7 +386,8 @@ function extractImages(
           data: dataMatch[2]!,
         });
       } else {
-        console.warn(`[Completions] Unsupported image URL format (only data: URIs supported): ${url.substring(0, 50)}...`);
+        // Should not happen after resolveImageUrls, but log just in case
+        console.warn(`[Completions] Unresolved image URL (not data: URI): ${url.substring(0, 50)}...`);
       }
     }
   }
@@ -296,34 +395,181 @@ function extractImages(
   return images;
 }
 
+// ── Tool / Config Parsing ────────────────────────────────────────────────
+
+interface ToolConfig {
+  enableGoogleSearch: boolean;
+  enableUrlContext: boolean;
+  enableCodeExecution: boolean;
+  functionDeclarations: GeminiFunctionDeclaration[];
+}
+
 /**
- * Detect if the request includes a Google Search grounding tool.
- * Checks for both OpenAI-style function tools and Google's native tool format.
+ * Parse the tools array into structured config.
+ * Detects Google Search, URL Context, Code Execution, and Function Calling tools.
+ *
+ * Supported formats:
+ * - Google native: { google_search: {} }, { google_search_retrieval: {} }
+ * - Google native: { url_context: {} }
+ * - Google native: { code_execution: {} }
+ * - OpenAI function tools: { type: "function", function: { name, description, parameters } }
+ * - Special function names: "googleSearch", "google_search", "urlContext", "url_context", "codeExecution", "code_execution"
  */
-function detectGoogleSearchTool(tools: unknown[] | undefined): boolean {
-  if (!tools || tools.length === 0) return false;
+function parseTools(tools: OpenAIChatRequest['tools']): ToolConfig {
+  const config: ToolConfig = {
+    enableGoogleSearch: false,
+    enableUrlContext: false,
+    enableCodeExecution: false,
+    functionDeclarations: [],
+  };
+
+  if (!tools || tools.length === 0) return config;
 
   for (const tool of tools) {
     if (!tool || typeof tool !== 'object') continue;
 
     const t = tool as Record<string, unknown>;
 
-    // Google native format: { google_search_retrieval: {} }
-    if ('google_search_retrieval' in t) return true;
-    if ('googleSearchRetrieval' in t) return true;
+    // Google native: { google_search_retrieval: {} } or { googleSearchRetrieval: {} }
+    if ('google_search_retrieval' in t || 'googleSearchRetrieval' in t) {
+      config.enableGoogleSearch = true;
+      continue;
+    }
+    // Google native: { google_search: {} } or { googleSearch: {} }
+    if ('google_search' in t || 'googleSearch' in t) {
+      config.enableGoogleSearch = true;
+      continue;
+    }
+    // Google native: { url_context: {} } or { urlContext: {} }
+    if ('url_context' in t || 'urlContext' in t) {
+      config.enableUrlContext = true;
+      continue;
+    }
+    // Google native: { code_execution: {} } or { codeExecution: {} }
+    if ('code_execution' in t || 'codeExecution' in t) {
+      config.enableCodeExecution = true;
+      continue;
+    }
 
-    // Google native format: { google_search: {} }
-    if ('google_search' in t) return true;
-    if ('googleSearch' in t) return true;
-
-    // OpenAI function format: { type: "function", function: { name: "googleSearch" } }
+    // OpenAI function tool format: { type: "function", function: { name, ... } }
     if (t.type === 'function' && t.function && typeof t.function === 'object') {
       const fn = t.function as Record<string, unknown>;
-      if (fn.name === 'googleSearch' || fn.name === 'google_search') return true;
+      const fnName = String(fn.name ?? '');
+
+      // Check for special tool names that map to Google features
+      if (fnName === 'googleSearch' || fnName === 'google_search') {
+        config.enableGoogleSearch = true;
+        continue;
+      }
+      if (fnName === 'urlContext' || fnName === 'url_context') {
+        config.enableUrlContext = true;
+        continue;
+      }
+      if (fnName === 'codeExecution' || fnName === 'code_execution') {
+        config.enableCodeExecution = true;
+        continue;
+      }
+
+      // Regular function tool → map to Gemini functionDeclaration
+      config.functionDeclarations.push({
+        name: fnName,
+        description: fn.description ? String(fn.description) : undefined,
+        parameters: fn.parameters as Record<string, unknown> | undefined,
+      });
     }
   }
 
-  return false;
+  return config;
+}
+
+/**
+ * Parse OpenAI response_format into our internal ResponseFormatConfig.
+ * Supports: text, json_object, json_schema (with schema extraction).
+ */
+function parseResponseFormat(
+  format: OpenAIChatRequest['response_format'],
+): ResponseFormatConfig | undefined {
+  if (!format) return undefined;
+  if (format.type === 'text') return undefined; // text is the default, no config needed
+
+  if (format.type === 'json_object') {
+    return { type: 'json_object' };
+  }
+
+  if (format.type === 'json_schema' && 'json_schema' in format) {
+    return {
+      type: 'json_schema',
+      schema: format.json_schema.schema,
+    };
+  }
+
+  return undefined;
+}
+
+/**
+ * Convert Gemini function call results into OpenAI tool_calls format.
+ */
+function buildToolCalls(
+  functionCalls?: GeminiFunctionCallResult[],
+): OpenAIToolCall[] | undefined {
+  if (!functionCalls || functionCalls.length === 0) return undefined;
+
+  return functionCalls.map((fc) => ({
+    id: `call_${crypto.randomUUID().replace(/-/g, '').substring(0, 24)}`,
+    type: 'function' as const,
+    function: {
+      name: fc.name,
+      arguments: JSON.stringify(fc.args),
+    },
+  }));
+}
+
+// ── Multimodal Response Builder ─────────────────────────────────────────
+
+/**
+ * Build response content. Returns a plain string for text-only responses
+ * (most common case, backward-compatible). Returns an array of content parts
+ * for multimodal responses (text + images from image-generation models).
+ *
+ * Images are encoded as data: URIs in image_url parts.
+ */
+function buildResponseContent(
+  text: string,
+  images?: InlineImage[],
+): string | OpenAIContentPart[] {
+  // Text-only — return plain string (most clients expect this)
+  if (!images || images.length === 0) {
+    return text;
+  }
+
+  // Multimodal — build array of content parts
+  const parts: OpenAIContentPart[] = [];
+
+  if (text) {
+    parts.push({ type: 'text', text });
+  }
+
+  for (const img of images) {
+    parts.push({
+      type: 'image_url',
+      image_url: { url: `data:${img.mimeType};base64,${img.data}` },
+    });
+  }
+
+  return parts;
+}
+
+// ── Image Capability Detection ──────────────────────────────────────────
+
+/**
+ * Check if a model supports image output (native image generation).
+ * These models need responseModalities=[TEXT, IMAGE] to return images.
+ */
+function isImageCapableModel(model: string): boolean {
+  const m = model.toLowerCase();
+  return m.includes('image')
+    || m.includes('imagen')
+    || (m.includes('gemini-2.0') && m.includes('flash') && m.includes('exp'));
 }
 
 // ── Token Estimation ────────────────────────────────────────────────────

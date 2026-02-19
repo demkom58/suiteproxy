@@ -31,11 +31,48 @@ export interface ThinkingDirective {
   level: ThinkingLevel | null;
 }
 
+// ── OpenAI Message (subset for context passing) ─────────────────────────
+export interface ChatMessage {
+  role: 'user' | 'assistant' | 'system' | 'tool';
+  content: string | null | Array<
+    | { type: 'text'; text: string }
+    | { type: 'image_url'; image_url: { url: string } }
+  >;
+  /** Tool call ID — for role='tool' (function result). */
+  tool_call_id?: string;
+  /** Function name — for role='tool'. */
+  name?: string;
+  /** Tool calls made by the assistant. */
+  tool_calls?: Array<{
+    id: string;
+    type: 'function';
+    function: { name: string; arguments: string };
+  }>;
+}
+
+// ── Gemini Function Declaration (mapped from OpenAI tools) ──────────────
+export interface GeminiFunctionDeclaration {
+  name: string;
+  description?: string;
+  parameters?: Record<string, unknown>; // JSON Schema
+}
+
+// ── Response Format Config ──────────────────────────────────────────────
+export interface ResponseFormatConfig {
+  /** 'text' | 'json_object' | 'json_schema' */
+  type: string;
+  /** JSON Schema object — when type is 'json_schema'. */
+  schema?: Record<string, unknown>;
+}
+
 // ── Request Context ─────────────────────────────────────────────────────
 export interface RequestContext {
   reqId: string;
   model: string;
+  /** @deprecated Use `messages` instead. Kept for backward compat. */
   prompt: string;
+  /** Structured messages for multi-turn (preferred over prompt) */
+  messages?: ChatMessage[];
   systemInstruction?: string;
   stream: boolean;
   temperature?: number;
@@ -46,6 +83,18 @@ export interface RequestContext {
   images?: Array<{ mimeType: string; data: string }>;
   enableGoogleSearch?: boolean;
   enableUrlContext?: boolean;
+  /** Enable Gemini code execution tool. */
+  enableCodeExecution?: boolean;
+  /** Function declarations for Gemini function calling (mapped from OpenAI tools). */
+  functionDeclarations?: GeminiFunctionDeclaration[];
+  /** Structured output / response format config. */
+  responseFormat?: ResponseFormatConfig;
+  /** Response modalities — set for image generation models */
+  responseModalities?: number[];
+  /** TTS config — when set, uses AI Studio's dedicated TTS page instead of chat */
+  ttsConfig?: {
+    voice: string;
+  };
 }
 
 // ── Queue Item ──────────────────────────────────────────────────────────
@@ -55,13 +104,51 @@ export interface QueueItem {
   reject: (reason: Error) => void;
   abortSignal?: AbortSignal;
   /** For streaming requests: called with the polling generator once the page is ready */
-  streamCallback?: (generator: AsyncGenerator<{ delta: string; done: boolean }>) => void;
+  streamCallback?: (generator: AsyncGenerator<StreamDelta>) => void;
+}
+
+/** Inline image data returned by image-generation models. */
+export interface InlineImage {
+  mimeType: string;
+  data: string; // base64
+}
+
+/** Inline audio data returned by TTS models. */
+export interface InlineAudio {
+  mimeType: string;
+  data: string; // base64
+}
+
+/** A function call returned by Gemini (from the GenerateContent response). */
+export interface GeminiFunctionCallResult {
+  name: string;
+  args: Record<string, unknown>;
 }
 
 export interface QueueResult {
   text: string;
   finishReason: string;
   thinkingText?: string;
+  /** Inline images from image-generation models. */
+  images?: InlineImage[];
+  /** Inline audio from TTS models. */
+  audioChunks?: InlineAudio[];
+  /** Function calls requested by the model. */
+  functionCalls?: GeminiFunctionCallResult[];
+}
+
+/** A single streaming chunk yielded by the network/DOM polling generators. */
+export interface StreamDelta {
+  delta: string;
+  done: boolean;
+  /** Thinking/reasoning content (separate from main delta text). */
+  thinking?: string;
+  /** Inline images from image-generation models. */
+  images?: InlineImage[];
+  /** Inline audio from TTS models. */
+  audioChunks?: InlineAudio[];
+  /** Function calls requested by the model. */
+  functionCalls?: GeminiFunctionCallResult[];
 }
 
 // ── Parsed Model ────────────────────────────────────────────────────────

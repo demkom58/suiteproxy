@@ -16,9 +16,9 @@ services:
       - "3000:3000"
     volumes:
       - .:/app # Mount source for hot reload
-      - node_modules:/app/node_modules # Separate volume for node_modules (avoids Win/Linux binary conflicts)
-      - bun_cache:/root/.bun # Persist bun cache
-      - camoufox_cache:/root/.cache/camoufox # Persist Camoufox binary (~260MB — avoid re-downloading)
+      - ./data/dev/node_modules:/app/node_modules # Separate volume for node_modules (avoids Win/Linux binary conflicts)
+      - ./data/dev/.bun:/root/.bun # Persist bun cache
+      - ./data/dev/camoufox:/root/.cache/camoufox # Persist Camoufox binary (~260MB — avoid re-downloading)
     environment:
       - DISPLAY=:99
       - DOCKER=1
@@ -29,8 +29,3 @@ services:
     tty: true
     shm_size: "2gb"
     restart: unless-stopped
-
-volumes:
-  node_modules:
-  bun_cache:
-  camoufox_cache:

@@ -2,62 +2,16 @@
  * GET /api/v1/models
  *
  * Lists available Gemini models from Google's internal API.
- * This endpoint uses direct API calls (no BotGuard needed for ListModels).
+ * Uses callMakerSuiteRpc for authenticated access via SAPISID cookie auth.
  */
-import { useDb, generateTripleHash, getSapiFromCookie } from '~~/server/utils/suite';
-import type { AccountRecord, SuitemakerCreds } from '~~/shared/types';
+import { getGoogleApiCredentials, callMakerSuiteRpc } from '~~/server/utils/google-api';
 
 export default defineEventHandler(async (event) => {
-  const db = useDb();
-
   const bearer = getHeader(event, 'authorization')?.replace('Bearer ', '');
-  const accRow = (bearer
-    ? db.query('SELECT * FROM accounts WHERE id = ?').get(bearer)
-    : db.query('SELECT * FROM accounts ORDER BY last_sync DESC LIMIT 1').get()
-  ) as AccountRecord | undefined;
-
-  if (!accRow) {
-    throw createError({ statusCode: 503, statusMessage: 'No accounts connected' });
-  }
-
-  const creds: SuitemakerCreds = JSON.parse(accRow.creds);
-  const sapisid = getSapiFromCookie(creds.cookie);
-
-  if (!sapisid) {
-    throw createError({ statusCode: 401, statusMessage: 'Session Expired (No SAPISID)' });
-  }
-
-  const userAgent = creds.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0';
-  const url = 'https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ListModels';
-  const authHash = await generateTripleHash(sapisid);
-
-  const doFetch = async (authUser: string) => {
-    return fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': authHash,
-        'X-Goog-Api-Key': creds.api_key,
-        'X-Goog-AuthUser': authUser,
-        'X-User-Agent': 'grpc-web-javascript/0.1',
-        'X-Goog-Ext-519733851-bin': 'CAASA1JVQRgBMAE4BEAA',
-        'Content-Type': 'application/json+protobuf',
-        'Origin': 'https://aistudio.google.com',
-        'Referer': 'https://aistudio.google.com/',
-        'User-Agent': userAgent,
-        'Cookie': creds.cookie,
-      },
-      body: '[]',
-    });
-  };
+  const creds = getGoogleApiCredentials(bearer);
 
   try {
-    // Try with stored authUser, fallback to "0"
-    let response = await doFetch(creds.authUser || '0');
-
-    if ((response.status === 401 || response.status === 403) && creds.authUser !== '0') {
-      console.warn(`[ListModels] AuthUser ${creds.authUser} failed. Retrying with 0...`);
-      response = await doFetch('0');
-    }
+    const response = await callMakerSuiteRpc('ListModels', [], creds);
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -122,10 +76,68 @@ interface ModelCapabilities {
   supports_vision: boolean;
   /** Whether the model supports Google Search grounding */
   supports_search_grounding: boolean;
+  /** Whether the model supports native image generation (output) */
+  supports_image_generation: boolean;
+  /** Whether the model supports text-to-speech */
+  supports_tts: boolean;
+  /** Whether the model supports audio transcription (speech-to-text) */
+  supports_audio_transcription: boolean;
+  /** Whether the model supports text embeddings */
+  supports_embeddings: boolean;
 }
 
 function getModelCapabilities(modelId: string): ModelCapabilities {
   const m = modelId.toLowerCase();
+
+  // Check if model supports native image generation
+  // Currently: gemini-2.0-flash-exp, gemini-2.5-flash/pro with -image suffix,
+  // and gemini-3 models with image capability
+  const supportsImageGen = m.includes('image')
+    || (m.includes('gemini-2.0') && m.includes('flash') && m.includes('exp'));
+
+  // Check TTS support — only dedicated TTS models
+  const supportsTTS = m.includes('tts');
+
+  // Check embedding support — text-embedding models
+  const supportsEmbeddings = m.includes('embedding');
+
+  // Audio transcription — most multimodal Gemini models support audio input
+  const supportsAudioTranscription = !supportsTTS && !supportsEmbeddings
+    && (m.includes('gemini-2') || m.includes('gemini-3'));
+
+  // TTS models — special case: minimal capabilities, TTS only
+  if (supportsTTS) {
+    return {
+      context_window: 32_768,
+      max_output_tokens: 8_192,
+      supports_thinking: false,
+      thinking_type: null,
+      thinking_category: 'NON_THINKING',
+      supports_vision: false,
+      supports_search_grounding: false,
+      supports_image_generation: false,
+      supports_tts: true,
+      supports_audio_transcription: false,
+      supports_embeddings: false,
+    };
+  }
+
+  // Embedding models — special case
+  if (supportsEmbeddings) {
+    return {
+      context_window: 2_048,
+      max_output_tokens: 0,
+      supports_thinking: false,
+      thinking_type: null,
+      thinking_category: 'NON_THINKING',
+      supports_vision: false,
+      supports_search_grounding: false,
+      supports_image_generation: false,
+      supports_tts: false,
+      supports_audio_transcription: false,
+      supports_embeddings: true,
+    };
+  }
 
   // Gemini 3 Pro
   if (m.includes('gemini-3') && m.includes('pro')) {
@@ -137,6 +149,10 @@ function getModelCapabilities(modelId: string): ModelCapabilities {
       thinking_category: 'THINKING_LEVEL_PRO',
       supports_vision: true,
       supports_search_grounding: true,
+      supports_image_generation: supportsImageGen,
+      supports_tts: false,
+      supports_audio_transcription: supportsAudioTranscription,
+      supports_embeddings: false,
     };
   }
 
@@ -150,6 +166,10 @@ function getModelCapabilities(modelId: string): ModelCapabilities {
       thinking_category: 'THINKING_LEVEL_FLASH',
       supports_vision: true,
       supports_search_grounding: true,
+      supports_image_generation: supportsImageGen,
+      supports_tts: false,
+      supports_audio_transcription: supportsAudioTranscription,
+      supports_embeddings: false,
     };
   }
 
@@ -163,6 +183,10 @@ function getModelCapabilities(modelId: string): ModelCapabilities {
       thinking_category: 'THINKING_PRO_25',
       supports_vision: true,
       supports_search_grounding: true,
+      supports_image_generation: supportsImageGen,
+      supports_tts: false,
+      supports_audio_transcription: supportsAudioTranscription,
+      supports_embeddings: false,
     };
   }
 
@@ -176,6 +200,10 @@ function getModelCapabilities(modelId: string): ModelCapabilities {
       thinking_category: 'THINKING_FLASH_25',
       supports_vision: true,
       supports_search_grounding: true,
+      supports_image_generation: supportsImageGen,
+      supports_tts: false,
+      supports_audio_transcription: supportsAudioTranscription,
+      supports_embeddings: false,
     };
   }
 
@@ -189,6 +217,10 @@ function getModelCapabilities(modelId: string): ModelCapabilities {
       thinking_category: 'NON_THINKING',
       supports_vision: true,
       supports_search_grounding: true,
+      supports_image_generation: supportsImageGen,
+      supports_tts: false,
+      supports_audio_transcription: supportsAudioTranscription,
+      supports_embeddings: false,
     };
   }
 
@@ -202,6 +234,10 @@ function getModelCapabilities(modelId: string): ModelCapabilities {
       thinking_category: 'NON_THINKING',
       supports_vision: true,
       supports_search_grounding: true,
+      supports_image_generation: false,
+      supports_tts: false,
+      supports_audio_transcription: supportsAudioTranscription,
+      supports_embeddings: false,
     };
   }
 
@@ -215,6 +251,10 @@ function getModelCapabilities(modelId: string): ModelCapabilities {
       thinking_category: 'NON_THINKING',
       supports_vision: true,
       supports_search_grounding: true,
+      supports_image_generation: false,
+      supports_tts: false,
+      supports_audio_transcription: supportsAudioTranscription,
+      supports_embeddings: false,
     };
   }
 
@@ -227,6 +267,10 @@ function getModelCapabilities(modelId: string): ModelCapabilities {
     thinking_category: 'NON_THINKING',
     supports_vision: true,
     supports_search_grounding: true,
+    supports_image_generation: supportsImageGen,
+    supports_tts: false,
+    supports_audio_transcription: false,
+    supports_embeddings: false,
   };
 }
 

@@ -16,6 +16,7 @@ import { cookieToStorageState } from './auth-converter';
 import { AI_STUDIO_NEW_CHAT, AI_STUDIO_URL_PATTERN, PROMPT_TEXTAREA, INPUT_WRAPPER } from './selectors';
 import { AuthenticationError, BrowserNotInitializedError, PageNotReadyError } from './errors';
 import { installInterceptorOnContext, resetInterceptorState } from './network-interceptor';
+import { clearTokenCache } from './drive-uploader';
 
 // ── Global state (survives hot reloads) ─────────────────────────────────
 declare global {
@@ -122,6 +123,9 @@ export async function closeBrowser(): Promise<void> {
   // Reset interceptor state (route handler references, buffers)
   resetInterceptorState();
 
+  // Clear cached OAuth2 token (account-specific)
+  clearTokenCache();
+
   if (state.page) {
     try { await state.page.close(); } catch { /* ignore */ }
     state.page = null;
@@ -154,11 +158,47 @@ export async function refreshPage(): Promise<void> {
 // ── Internal ────────────────────────────────────────────────────────────
 
 /**
+ * Pre-flight check for Camoufox installation integrity.
+ * Docker volume mounts can corrupt files (null bytes instead of content).
+ * Verifies that critical config files are valid JSON before launching.
+ */
+function verifyCamoufoxInstallation(): void {
+  const { readFileSync, existsSync } = require('node:fs') as typeof import('node:fs');
+  const { join } = require('node:path') as typeof import('node:path');
+  const cacheDir = join(process.env.HOME || '/root', '.cache', 'camoufox');
+
+  const criticalFiles = ['version.json', 'properties.json'];
+  for (const file of criticalFiles) {
+    const filePath = join(cacheDir, file);
+    if (!existsSync(filePath)) continue;
+
+    try {
+      const content = readFileSync(filePath, 'utf-8');
+      // Check for null byte corruption (Docker volume issue)
+      if (content.includes('\0')) {
+        console.error(`[Browser] CORRUPTED: ${filePath} contains null bytes — Camoufox installation may be damaged`);
+        console.error(`[Browser] Fix: delete ${cacheDir} and restart to re-download Camoufox`);
+        throw new Error(`Camoufox installation corrupted: ${file} contains null bytes. Delete ~/.cache/camoufox/ and restart.`);
+      }
+      JSON.parse(content); // Validate JSON
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        console.error(`[Browser] CORRUPTED: ${filePath} is not valid JSON`);
+        throw new Error(`Camoufox installation corrupted: ${file} is not valid JSON. Delete ~/.cache/camoufox/ and restart.`);
+      }
+      throw error; // Re-throw our own error
+    }
+  }
+}
+
+/**
  * Launch Camoufox browser with platform-aware configuration.
  * Uses the high-level Camoufox() API first (handles OS-specific quirks),
  * falls back to manual launchOptions + firefox.launch if that fails.
  */
 async function launchCamoufox(isWindows: boolean, isLinux: boolean): Promise<Browser> {
+  // Verify installation integrity before attempting launch
+  verifyCamoufoxInstallation();
   // Method 1: Camoufox() high-level API — recommended, handles internals
   try {
     console.log('[Browser] Trying Camoufox() high-level API...');
@@ -170,38 +210,48 @@ async function launchCamoufox(isWindows: boolean, isLinux: boolean): Promise<Bro
     return browser as Browser;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
+    const stack = error instanceof Error ? error.stack?.substring(0, 500) : '';
     console.warn(`[Browser] High-level Camoufox() failed: ${msg}`);
+    if (stack) console.warn(`[Browser] Stack: ${stack}`);
     console.log('[Browser] Falling back to manual launch...');
   }
 
   // Method 2: Manual launchOptions + firefox.launch (more control, proven on Linux)
-  const cfxOptions = await launchOptions({
-    headless: false,
-    os: isWindows ? 'windows' : undefined,
-  });
-  console.log(`[Browser] Launch options ready (executablePath: ${cfxOptions.executablePath})`);
+  try {
+    const cfxOptions = await launchOptions({
+      headless: false,
+      os: isWindows ? 'windows' : undefined,
+    });
+    console.log(`[Browser] Launch options ready (executablePath: ${cfxOptions.executablePath})`);
 
-  const launchEnv: Record<string, string | undefined> = {
-    ...process.env,
-    ...(cfxOptions.env ?? {}),
-  };
-  if (isLinux) {
-    launchEnv.DISPLAY = process.env.DISPLAY || ':99';
+    const launchEnv: Record<string, string | undefined> = {
+      ...process.env,
+      ...(cfxOptions.env ?? {}),
+    };
+    if (isLinux) {
+      launchEnv.DISPLAY = process.env.DISPLAY || ':99';
+    }
+
+    console.log(`[Browser] Launching Firefox...${isLinux ? ` (DISPLAY=${launchEnv.DISPLAY})` : ''}`);
+    const browser = await firefox.launch({
+      ...cfxOptions,
+      args: [
+        ...(cfxOptions.args ?? []),
+        '--no-remote',
+      ],
+      timeout: 120_000, // 2 min timeout for Windows (slower startup)
+      env: launchEnv,
+    });
+
+    console.log('[Browser] Camoufox launched via manual launch');
+    return browser;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    const stack = error instanceof Error ? error.stack?.substring(0, 500) : '';
+    console.error(`[Browser] Manual launch also failed: ${msg}`);
+    if (stack) console.error(`[Browser] Stack: ${stack}`);
+    throw error;
   }
-
-  console.log(`[Browser] Launching Firefox...${isLinux ? ` (DISPLAY=${launchEnv.DISPLAY})` : ''}`);
-  const browser = await firefox.launch({
-    ...cfxOptions,
-    args: [
-      ...(cfxOptions.args ?? []),
-      '--no-remote',
-    ],
-    timeout: 120_000, // 2 min timeout for Windows (slower startup)
-    env: launchEnv,
-  });
-
-  console.log('[Browser] Camoufox launched via manual launch');
-  return browser;
 }
 
 async function launchAndNavigate(
@@ -385,7 +435,7 @@ export { switchModel } from './model-switcher';
 export { saveErrorSnapshot } from './snapshots';
 export { installInterceptor, installInterceptorOnContext, startCapture, endCapture, consumeChunks, consumeStreamingChunks, hasRouteFired, resetInterceptorState } from './network-interceptor';
 export type { StreamChunk } from './network-interceptor';
-export type { BrowserState, RequestContext, QueueResult, ParsedModel, ThinkingDirective } from './types';
+export type { BrowserState, RequestContext, QueueResult, StreamDelta, ParsedModel, ThinkingDirective } from './types';
 export {
   BrowserAutomationError,
   BrowserNotInitializedError,

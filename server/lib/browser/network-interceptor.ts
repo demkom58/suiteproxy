@@ -23,8 +23,11 @@
 //   - We replay the EXACT same request (same cookies, headers, auth) so Google can't tell
 
 import type { Page, BrowserContext, Route, Response as PlaywrightResponse, Request as PlaywrightRequest } from 'playwright-core';
+import type { InlineImage, InlineAudio } from './types';
 
 // ── Types ───────────────────────────────────────────────────────────────
+
+export type { InlineImage };
 
 export interface StreamChunk {
   text: string;
@@ -32,6 +35,10 @@ export interface StreamChunk {
   done: boolean;
   error?: string;
   finishReason?: string;
+  /** Inline images returned by image-generation models (base64 encoded). */
+  images?: InlineImage[];
+  /** Inline audio returned by TTS models (base64 encoded). */
+  audioChunks?: InlineAudio[];
 }
 
 interface BufferChunk extends StreamChunk {
@@ -59,14 +66,24 @@ interface IncrementalParserState {
   parsedChunkCount: number;
 }
 
-function extractTextParts(
+interface ContentPart {
+  text: string;
+  isThinking: boolean;
+  image?: InlineImage;
+  audio?: InlineAudio;
+}
+
+function extractContentParts(
   arr: unknown,
   maxDepth = 20,
-): Array<{ text: string; isThinking: boolean }> {
-  const results: Array<{ text: string; isThinking: boolean }> = [];
+): ContentPart[] {
+  const results: ContentPart[] = [];
 
   function walk(item: unknown, depth: number): void {
     if (depth > maxDepth || !Array.isArray(item)) return;
+
+    // Text part pattern: [null, "text content", ...]
+    // Position 0 = null, position 1 = text string
     if (item.length >= 2 && item[0] === null && typeof item[1] === 'string') {
       const content = item[1] as string;
       if (content.length > 0) {
@@ -83,6 +100,34 @@ function extractTextParts(
       }
       return;
     }
+
+    // Inline data part pattern: [null, null, ["<mimeType>", "<base64data>"]]
+    // Position 0 = null (no text), position 1 = null, position 2 = Blob [mimeType, data]
+    // The Blob proto: field 1 = mime_type (pos 0), field 2 = data (pos 1)
+    // Used for both image and audio inline data from the model.
+    if (
+      item.length >= 3
+      && item[0] === null
+      && item[1] === null
+      && Array.isArray(item[2])
+      && item[2].length >= 2
+      && typeof item[2][0] === 'string'
+      && typeof item[2][1] === 'string'
+    ) {
+      const mimeType = item[2][0] as string;
+      const data = item[2][1] as string;
+
+      if (mimeType.startsWith('image/') && data.length > 100) {
+        results.push({ text: '', isThinking: false, image: { mimeType, data } });
+        return;
+      }
+
+      if (mimeType.startsWith('audio/') && data.length > 100) {
+        results.push({ text: '', isThinking: false, audio: { mimeType, data } });
+        return;
+      }
+    }
+
     for (let i = 0; i < item.length; i++) {
       if (Array.isArray(item[i])) walk(item[i], depth + 1);
     }
@@ -90,6 +135,16 @@ function extractTextParts(
 
   walk(arr, 0);
   return results;
+}
+
+/** Extract only text parts (backward-compatible wrapper). */
+function extractTextParts(
+  arr: unknown,
+  maxDepth = 20,
+): Array<{ text: string; isThinking: boolean }> {
+  return extractContentParts(arr, maxDepth)
+    .filter(p => !p.image)
+    .map(p => ({ text: p.text, isThinking: p.isThinking }));
 }
 
 /**
@@ -159,9 +214,10 @@ function parseIncrementalChunks(
 
 /**
  * Parse complete response body into chunks (for non-streaming).
+ * Extracts text, thinking content, and inline images.
  */
-function parseResponseChunks(body: string): Array<{ text: string; thinking: string }> {
-  const chunks: Array<{ text: string; thinking: string }> = [];
+function parseResponseChunks(body: string): Array<{ text: string; thinking: string; images?: InlineImage[]; audioChunks?: InlineAudio[] }> {
+  const chunks: Array<{ text: string; thinking: string; images?: InlineImage[] }> = [];
   try {
     const outer: unknown = JSON.parse(body);
     if (!Array.isArray(outer) || outer.length === 0) return chunks;
@@ -170,15 +226,30 @@ function parseResponseChunks(body: string): Array<{ text: string; thinking: stri
 
     for (const chunk of inner) {
       if (!Array.isArray(chunk)) continue;
-      const parts = extractTextParts(chunk);
+
+      const parts = extractContentParts(chunk);
       let chunkText = '';
       let chunkThinking = '';
+      const chunkImages: InlineImage[] = [];
+      const chunkAudio: InlineAudio[] = [];
       for (const part of parts) {
-        if (part.isThinking) chunkThinking += part.text;
-        else chunkText += part.text;
+        if (part.image) {
+          chunkImages.push(part.image);
+        } else if (part.audio) {
+          chunkAudio.push(part.audio);
+        } else if (part.isThinking) {
+          chunkThinking += part.text;
+        } else {
+          chunkText += part.text;
+        }
       }
-      if (chunkText || chunkThinking) {
-        chunks.push({ text: chunkText, thinking: chunkThinking });
+      if (chunkText || chunkThinking || chunkImages.length > 0 || chunkAudio.length > 0) {
+        chunks.push({
+          text: chunkText,
+          thinking: chunkThinking,
+          ...(chunkImages.length > 0 ? { images: chunkImages } : {}),
+          ...(chunkAudio.length > 0 ? { audioChunks: chunkAudio } : {}),
+        });
       }
     }
   } catch { /* parse error */ }
@@ -216,7 +287,8 @@ async function replayAndStream(
     });
 
     if (!fetchResponse.ok) {
-      console.error(`[NetworkInterceptor:${reqId}] Replay failed: HTTP ${fetchResponse.status}`);
+      const errorBody = await fetchResponse.text().catch(() => '');
+      console.error(`[NetworkInterceptor:${reqId}] Replay failed: HTTP ${fetchResponse.status} — ${errorBody.substring(0, 500)}`);
       chunkBuffer.push({
         text: '', done: true,
         error: `HTTP ${fetchResponse.status}`,
@@ -226,20 +298,21 @@ async function replayAndStream(
       await route.fulfill({
         status: fetchResponse.status,
         headers: Object.fromEntries(fetchResponse.headers.entries()),
-        body: await fetchResponse.text(),
+        body: errorBody,
       });
       return;
     }
 
     if (!fetchResponse.body) {
       // No streaming body — read all at once
-      const body = await fetchResponse.text();
+      const body = (await fetchResponse.text()).replace(/\0/g, '');
       fullResponseBody = body;
       const parsed = parseResponseChunks(body);
       for (const chunk of parsed) {
-        if (chunk.text || chunk.thinking) {
+        if (chunk.text || chunk.thinking || chunk.images?.length || chunk.audioChunks?.length) {
           chunkBuffer.push({
             text: chunk.text, thinking: chunk.thinking,
+            images: chunk.images, audioChunks: chunk.audioChunks,
             done: false, reqId, timestamp: Date.now(), source: 'replay',
           });
         }
@@ -257,7 +330,9 @@ async function replayAndStream(
         if (done) break;
 
         const text = decoder.decode(value, { stream: true });
-        accumulated += text;
+        // Strip null bytes — gRPC-web binary framing can inject \0 characters
+        // that break JSON.parse() with "Unrecognized token '\0'"
+        accumulated += text.replace(/\0/g, '');
 
         // Parse any new complete chunks from the accumulated text
         const result = parseIncrementalChunks(accumulated, parserState);
@@ -270,7 +345,7 @@ async function replayAndStream(
       }
 
       // Final decode flush
-      accumulated += decoder.decode();
+      accumulated += decoder.decode().replace(/\0/g, '');
       const finalResult = parseIncrementalChunks(accumulated, parserState);
       if (finalResult.text || finalResult.thinking) {
         chunkBuffer.push({
@@ -322,6 +397,16 @@ async function handleGenerateContentRoute(route: Route): Promise<void> {
     return;
   }
 
+  // Verify this is the ACTUAL MakerSuiteService/GenerateContent RPC,
+  // not a jserror URL that happens to contain "GenerateContent" in its payload.
+  // The real URL always comes from alkalimakersuite-pa.clients6.google.com.
+  const requestUrl = route.request().url();
+  if (!requestUrl.includes('MakerSuiteService/GenerateContent')) {
+    // This is a false match (e.g., a jserror URL with "GenerateContent" in the error text)
+    await route.continue();
+    return;
+  }
+
   const reqId = captureReqId;
   routeFired = true;
 
@@ -346,19 +431,28 @@ async function handleGenerateContentRoute(route: Route): Promise<void> {
 
 async function handleGenerateContentResponse(response: PlaywrightResponse, reqId: string): Promise<void> {
   try {
+    // Skip false matches (jserror URLs containing "GenerateContent")
+    if (!response.url().includes('MakerSuiteService/GenerateContent')) return;
+
     const status = response.status();
     const bodyBuffer = await response.body();
-    const bodyText = bodyBuffer.toString('utf-8');
+    const bodyText = bodyBuffer.toString('utf-8').replace(/\0/g, '');
 
     console.log(`[NetworkInterceptor:${reqId}] Response complete: ${status}, ${bodyText.length} bytes`);
+
+    if (status >= 400) {
+      console.error(`[NetworkInterceptor:${reqId}] Error response: HTTP ${status} — body: ${bodyText.substring(0, 500)}`);
+    }
 
     if (status >= 200 && status < 300) {
       const parsedChunks = parseResponseChunks(bodyText);
       for (const chunk of parsedChunks) {
-        if (chunk.text || chunk.thinking) {
+        if (chunk.text || chunk.thinking || chunk.images?.length || chunk.audioChunks?.length) {
           chunkBuffer.push({
             text: chunk.text,
             thinking: chunk.thinking,
+            images: chunk.images,
+            audioChunks: chunk.audioChunks,
             done: false,
             reqId,
             timestamp: Date.now(),
@@ -416,7 +510,7 @@ export async function startCapture(page: Page, reqId: string, mode: 'streaming' 
   if (mode === 'non-streaming') {
     const onResponse = async (response: PlaywrightResponse) => {
       if (!captureActive) return;
-      if (!response.url().includes('GenerateContent')) return;
+      if (!response.url().includes('MakerSuiteService/GenerateContent')) return;
       page.off('response', onResponse);
       await handleGenerateContentResponse(response, reqId);
     };
@@ -498,7 +592,9 @@ export async function* consumeStreamingChunks(
 
     for (const chunk of matchingChunks) {
       if (chunk.error) { yield { text: '', done: true, error: chunk.error }; return; }
-      if (chunk.done && !chunk.text && !chunk.thinking) { yield { text: '', done: true }; return; }
+      if (chunk.done && !chunk.text && !chunk.thinking && !chunk.images?.length && !chunk.audioChunks?.length) { yield { text: '', done: true }; return; }
+      if (chunk.images?.length) { gotAnyData = true; yield { text: '', images: chunk.images, done: false }; }
+      if (chunk.audioChunks?.length) { gotAnyData = true; yield { text: '', audioChunks: chunk.audioChunks, done: false }; }
       if (chunk.text) { gotAnyData = true; yield { text: chunk.text, done: false }; }
       if (chunk.thinking) { gotAnyData = true; yield { text: '', thinking: chunk.thinking, done: false }; }
       if (chunk.done) { yield { text: '', done: true }; return; }
@@ -556,7 +652,9 @@ export async function* consumeChunks(
 
     for (const chunk of matchingChunks) {
       if (chunk.error) { yield { text: '', done: true, error: chunk.error }; return; }
-      if (chunk.done && !chunk.text && !chunk.thinking) { yield { text: '', done: true }; return; }
+      if (chunk.done && !chunk.text && !chunk.thinking && !chunk.images?.length && !chunk.audioChunks?.length) { yield { text: '', done: true }; return; }
+      if (chunk.images?.length) { gotAnyData = true; yield { text: '', images: chunk.images, done: false }; }
+      if (chunk.audioChunks?.length) { gotAnyData = true; yield { text: '', audioChunks: chunk.audioChunks, done: false }; }
       if (chunk.text) { gotAnyData = true; yield { text: chunk.text, done: false }; }
       if (chunk.thinking) { gotAnyData = true; yield { text: '', thinking: chunk.thinking, done: false }; }
       if (chunk.done) { yield { text: '', done: true }; return; }
