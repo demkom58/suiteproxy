@@ -62,16 +62,17 @@ const successRate = computed(() => {
         </div>
       </div>
 
-      <!-- Queue -->
+      <!-- Pool -->
       <div class="bg-slate-900/50 border border-slate-800/50 rounded-2xl p-4">
-        <div class="text-[10px] text-slate-600 font-bold uppercase tracking-wider mb-2">Queue</div>
+        <div class="text-[10px] text-slate-600 font-bold uppercase tracking-wider mb-2">Pool</div>
         <div class="flex items-baseline gap-2">
-          <span class="text-2xl font-black" :class="(queue?.queue_length ?? 0) > 0 ? 'text-amber-400' : 'text-slate-400'">
-            {{ queue?.queue_length ?? 0 }}
+          <span class="text-2xl font-black" :class="(queue?.pool?.busy_slots ?? 0) > 0 ? 'text-blue-400' : 'text-slate-400'">
+            {{ queue?.pool?.busy_slots ?? 0 }}/{{ queue?.pool?.max_size ?? 3 }}
           </span>
-          <span v-if="queue?.is_processing" class="text-[10px] text-blue-400 font-bold animate-pulse">PROCESSING</span>
+          <span v-if="(queue?.pool?.cached_conversations ?? 0) > 0" class="text-[10px] text-violet-400 font-bold">{{ queue?.pool?.cached_conversations }} cached</span>
+          <span v-if="(queue?.pool?.waiting_requests ?? 0) > 0" class="text-[10px] text-amber-400 font-bold animate-pulse">{{ queue?.pool?.waiting_requests }} waiting</span>
         </div>
-        <div class="text-[10px] text-slate-700 mt-1 font-mono">pending requests</div>
+        <div class="text-[10px] text-slate-700 mt-1 font-mono">concurrent pages</div>
       </div>
 
       <!-- Accounts -->

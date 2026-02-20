@@ -18,6 +18,14 @@ interface QueueStatus {
   is_processing: boolean;
   browser_ready: boolean;
   current_model: string | null;
+  pool?: {
+    total_slots: number;
+    busy_slots: number;
+    idle_slots: number;
+    cached_conversations: number;
+    max_size: number;
+    waiting_requests: number;
+  };
 }
 
 interface RequestStats {

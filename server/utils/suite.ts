@@ -12,8 +12,18 @@ db.run(`CREATE TABLE IF NOT EXISTS accounts (
     id TEXT PRIMARY KEY,    
     creds TEXT, 
     last_sync INTEGER, 
-    limited_until INTEGER DEFAULT 0
+    limited_until INTEGER DEFAULT 0,
+    fingerprint TEXT DEFAULT NULL,
+    proxy TEXT DEFAULT NULL
 )`);
+
+// Migration: add fingerprint & proxy columns to existing databases
+try {
+  db.run(`ALTER TABLE accounts ADD COLUMN fingerprint TEXT DEFAULT NULL`);
+} catch { /* column already exists */ }
+try {
+  db.run(`ALTER TABLE accounts ADD COLUMN proxy TEXT DEFAULT NULL`);
+} catch { /* column already exists */ }
 
 export const useDb = () => db;
 

@@ -11,7 +11,7 @@
  * But it works fine with SAPISID cookie auth from the user's Google session.
  */
 import { useDb, generateTripleHash, getSapiFromCookie } from './suite';
-import type { AccountRecord, SuitemakerCreds } from '~~/shared/types';
+import type { AccountRecord, SuitemakerCreds, ProxyConfig, ProxyEntry } from '~~/shared/types';
 
 export interface GoogleApiCredentials {
   cookie: string;
@@ -19,6 +19,8 @@ export interface GoogleApiCredentials {
   apiKey: string;
   authUser: string;
   userAgent: string;
+  /** Proxy URL for fetch() calls (e.g. "http://user:pass@host:port"). Null = direct. */
+  proxyUrl: string | null;
 }
 
 /**
@@ -46,13 +48,69 @@ export function getGoogleApiCredentials(bearer?: string): GoogleApiCredentials {
     throw createError({ statusCode: 401, statusMessage: 'Session Expired (No SAPISID)' });
   }
 
+  // Parse proxy config and select a proxy for API calls
+  const proxyUrl = resolveProxyUrl(accRow.proxy);
+
   return {
     cookie: creds.cookie,
     sapisid,
     apiKey: creds.api_key,
     authUser: creds.authUser || '0',
     userAgent: creds.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0',
+    proxyUrl,
   };
+}
+
+// ── Proxy Helpers ───────────────────────────────────────────────────────
+
+/**
+ * Select a proxy from the chain based on rotation strategy.
+ * Mirrors the logic in browser/index.ts for consistency.
+ */
+function selectProxy(proxyConfig: ProxyConfig): ProxyEntry | null {
+  if (!proxyConfig.enabled || !proxyConfig.chain?.length) return null;
+
+  const rotation = proxyConfig.rotation ?? 'none';
+  if (rotation === 'random') {
+    return proxyConfig.chain[Math.floor(Math.random() * proxyConfig.chain.length)]!;
+  }
+  if (rotation === 'round-robin') {
+    const idx = (globalThis._proxyRoundRobinIdx ?? 0) % proxyConfig.chain.length;
+    globalThis._proxyRoundRobinIdx = idx + 1;
+    return proxyConfig.chain[idx]!;
+  }
+  return proxyConfig.chain[0]!; // 'none' — use first
+}
+
+/**
+ * Convert a ProxyEntry to a URL string for Bun's native fetch `proxy` option.
+ * Format: "protocol://[user:pass@]host:port"
+ */
+function proxyEntryToUrl(entry: ProxyEntry): string {
+  const auth = entry.username
+    ? `${encodeURIComponent(entry.username)}${entry.password ? ':' + encodeURIComponent(entry.password) : ''}@`
+    : '';
+  return `${entry.protocol}://${auth}${entry.host}:${entry.port}`;
+}
+
+/**
+ * Parse the account's proxy JSON column and resolve to a proxy URL for fetch().
+ * Returns null if proxy is disabled or empty.
+ */
+function resolveProxyUrl(proxyJson: string | null): string | null {
+  if (!proxyJson) return null;
+
+  try {
+    const config = JSON.parse(proxyJson) as ProxyConfig;
+    const entry = selectProxy(config);
+    if (!entry) return null;
+
+    const url = proxyEntryToUrl(entry);
+    console.log(`[GoogleAPI] Using proxy: ${entry.protocol}://${entry.host}:${entry.port}`);
+    return url;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -77,6 +135,8 @@ export async function buildGoogleApiHeaders(creds: GoogleApiCredentials): Promis
 /**
  * Fetch with authUser retry — retries with authUser=0 if the stored authUser returns 401/403.
  * Shared implementation for both MakerSuiteRpc and Gemini REST API calls.
+ *
+ * Uses Bun's native `proxy` option in fetch() to route through account's configured proxy.
  */
 async function fetchWithAuthRetry(
   url: string,
@@ -87,20 +147,30 @@ async function fetchWithAuthRetry(
 ): Promise<Response> {
   const headers = await buildHeaders(creds);
 
-  const response = await fetch(url, {
+  // Bun-native proxy support: pass proxy URL directly to fetch()
+  const fetchOpts: RequestInit & { proxy?: string } = {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
-  });
+  };
+  if (creds.proxyUrl) {
+    fetchOpts.proxy = creds.proxyUrl;
+  }
+
+  const response = await fetch(url, fetchOpts);
 
   if ((response.status === 401 || response.status === 403) && creds.authUser !== '0') {
     console.warn(`[${label}] AuthUser ${creds.authUser} failed (${response.status}). Retrying with 0...`);
     const retryHeaders = await buildHeaders({ ...creds, authUser: '0' });
-    return fetch(url, {
+    const retryOpts: RequestInit & { proxy?: string } = {
       method: 'POST',
       headers: retryHeaders,
       body: JSON.stringify(body),
-    });
+    };
+    if (creds.proxyUrl) {
+      retryOpts.proxy = creds.proxyUrl;
+    }
+    return fetch(url, retryOpts);
   }
 
   return response;

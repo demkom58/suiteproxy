@@ -1,17 +1,18 @@
 /**
- * Request Queue — processes requests sequentially through the browser.
+ * Request Queue — manages concurrent request processing through browser page pool.
  *
  * Features:
- * - Sequential processing (browser can only handle one request at a time)
- * - Tiered error recovery (Tier 1: refresh → Tier 2: account switch)
+ * - Concurrent processing via page pool (configurable pool size, default 3)
+ * - Conversation caching — reuses pages with matching conversation prefix
+ * - Tiered error recovery (Tier 1: refresh page → Tier 2: switch account)
  * - Abort signal support for client disconnection
- * - Streaming requests also go through the queue (no bypass)
+ * - Streaming and non-streaming paths
  * - Error snapshots on failure
  * - Typed error classification for precise recovery
  */
 import type { RequestContext, QueueItem, QueueResult, StreamDelta } from './types';
 import type { Page } from 'playwright-core';
-import { getPage, refreshPage, closeBrowser, getCurrentModel, getCurrentAccountId } from './index';
+import { getPageForSlot, refreshPage, closeBrowser, getCurrentModel, getCurrentAccountId, type BrowserLaunchConfig } from './index';
 import { PageController } from './page-controller';
 import { switchModel } from './model-switcher';
 import { useDb } from '~~/server/utils/suite';
@@ -19,8 +20,7 @@ import {
   NoAccountsError,
   ClientDisconnectedError,
   isTier2Recoverable,
-  isFatalError,
-  type BrowserAutomationError,
+  isFatalError
 } from './errors';
 import { isRateLimitError } from './errors';
 import { saveErrorSnapshot } from './snapshots';
@@ -29,6 +29,16 @@ import { deleteDriveFiles, type DriveAuthCredentials } from './drive-uploader';
 import { generateSpeech } from './tts-controller';
 import { logRequestUpdate } from '~~/server/utils/request-log';
 import { generateOpenAIId } from '~~/server/utils/helpers';
+import {
+  acquireSlot,
+  releaseSlot,
+  computeConversationHash,
+  computeFullConversationHash,
+  getPoolStatus,
+  evictIdleSlots,
+  type PageSlot,
+  type AcquireResult,
+} from './page-pool';
 
 // ── SSE Helpers ─────────────────────────────────────────────────────────
 
@@ -49,236 +59,205 @@ function buildSSEChunk(
   });
 }
 
-// ── Queue State (survives hot reloads) ──────────────────────────────────
+// ── Legacy Queue State (for backward compat with processQueue drain) ────
 declare global {
-  var _requestQueue: QueueItem[] | undefined;
-  var _isProcessing: boolean | undefined;
   var _currentPage: Page | null;
+  var _activeRequests: number | undefined;
 }
 
-if (!globalThis._requestQueue) globalThis._requestQueue = [];
-if (globalThis._isProcessing === undefined) globalThis._isProcessing = false;
 if (globalThis._currentPage === undefined) globalThis._currentPage = null;
+if (globalThis._activeRequests === undefined) globalThis._activeRequests = 0;
 
 const MAX_RETRIES = 3;
 
 // ── Public API ──────────────────────────────────────────────────────────
 
 /**
- * Enqueue a request for processing. Returns a promise that resolves with the response.
+ * Process a non-streaming request. Acquires a pool slot, executes, and releases.
+ * Concurrent requests are handled by the pool — each gets its own page.
  */
-export function enqueueRequest(
+export async function enqueueRequest(
   context: RequestContext,
   abortSignal?: AbortSignal,
 ): Promise<QueueResult> {
-  return new Promise<QueueResult>((resolve, reject) => {
-    if (abortSignal?.aborted) {
-      reject(new ClientDisconnectedError('Request aborted before enqueue', context.reqId));
-      return;
-    }
+  if (abortSignal?.aborted) {
+    throw new ClientDisconnectedError('Request aborted before processing', context.reqId);
+  }
 
-    const item: QueueItem = { context, resolve, reject, abortSignal };
-    globalThis._requestQueue!.push(item);
+  globalThis._activeRequests = (globalThis._activeRequests ?? 0) + 1;
+  const poolInfo = getPoolStatus();
+  console.log(`[Queue] Processing ${context.reqId} (active: ${globalThis._activeRequests}, pool: ${poolInfo.busySlots}/${poolInfo.totalSlots})`);
 
-    console.log(`[Queue] Enqueued request ${context.reqId} (queue size: ${globalThis._requestQueue!.length})`);
-
-    if (!globalThis._isProcessing) {
-      processQueue().catch(err => {
-        console.error('[Queue] Processing loop error:', err);
-      });
-    }
-  });
+  try {
+    return await executeWithRetry(context, abortSignal);
+  } finally {
+    globalThis._activeRequests = Math.max(0, (globalThis._activeRequests ?? 1) - 1);
+    // Periodically evict idle slots
+    evictIdleSlots().catch(() => {});
+  }
 }
 
 /**
- * Enqueue a streaming request. Returns an async generator of SSE events.
- * Unlike the old implementation, this now goes through the queue properly.
+ * Process a streaming request. Returns an async generator of SSE events.
+ * Acquires a pool slot, streams through it, and releases when done.
  */
 export async function* enqueueStreamingRequest(
   context: RequestContext,
   abortSignal?: AbortSignal,
 ): AsyncGenerator<string> {
-  // Create a bridge: the queue resolves with a special streaming result
-  // containing an async generator that yields chunks
-  const streamContext: RequestContext = { ...context, stream: true };
+  if (abortSignal?.aborted) {
+    throw new ClientDisconnectedError('Request aborted before processing', context.reqId);
+  }
 
-  // We need a different approach for streaming:
-  // Execute through the queue but yield SSE chunks as they arrive
+  const streamContext: RequestContext = { ...context, stream: true };
   const chatId = generateOpenAIId('chatcmpl');
   const model = context.model.startsWith('models/') ? context.model : `models/${context.model}`;
   const created = Math.floor(Date.now() / 1000);
 
-  // Wait for our turn in the queue, then stream
-  const streamResult = await new Promise<AsyncGenerator<StreamDelta>>((resolve, reject) => {
-    if (abortSignal?.aborted) {
-      reject(new ClientDisconnectedError('Request aborted before enqueue', context.reqId));
-      return;
-    }
+  globalThis._activeRequests = (globalThis._activeRequests ?? 0) + 1;
+  const poolInfo = getPoolStatus();
+  console.log(`[Queue] Streaming ${context.reqId} (active: ${globalThis._activeRequests}, pool: ${poolInfo.busySlots}/${poolInfo.totalSlots})`);
 
-    const item: QueueItem = {
-      context: streamContext,
-      resolve: (result) => {
-        // This won't be called in streaming mode
-        resolve(result as unknown as AsyncGenerator<StreamDelta>);
-      },
-      reject,
-      abortSignal,
-      streamCallback: (generator) => resolve(generator),
-    };
-    globalThis._requestQueue!.push(item);
+  try {
+    const streamResult = await executeStreamingWithRetry(streamContext, abortSignal);
 
-    console.log(`[Queue] Enqueued streaming request ${context.reqId} (queue size: ${globalThis._requestQueue!.length})`);
+    // Yield SSE chunks from the generator
+    let chunkIndex = 0;
+    let hadFunctionCalls = false;
+    for await (const chunk of streamResult) {
+      chunkIndex++;
+      console.log(`[Queue] Stream chunk #${chunkIndex}: delta=${chunk.delta.length} chars, thinking=${chunk.thinking?.length ?? 0} chars, functionCalls=${chunk.functionCalls?.length ?? 0}, done=${chunk.done}`);
+      if (abortSignal?.aborted) break;
 
-    if (!globalThis._isProcessing) {
-      processQueue().catch(err => {
-        console.error('[Queue] Processing loop error:', err);
-      });
-    }
-  });
+      // Emit thinking/reasoning content
+      if (chunk.thinking) {
+        yield `data: ${buildSSEChunk(chatId, created, model, { reasoning_content: chunk.thinking }, null)}\n\n`;
+      }
 
-  // Now yield SSE chunks from the generator
-  console.log(`[Queue] enqueueStreamingRequest: got generator, starting iteration for ${context.reqId}`);
-  let chunkIndex = 0;
-  let hadFunctionCalls = false;
-  for await (const chunk of streamResult) {
-    chunkIndex++;
-    console.log(`[Queue] Stream chunk #${chunkIndex}: delta=${chunk.delta.length} chars, thinking=${chunk.thinking?.length ?? 0} chars, functionCalls=${chunk.functionCalls?.length ?? 0}, done=${chunk.done}`);
-    if (abortSignal?.aborted) break;
+      // Emit function calls
+      if (chunk.functionCalls?.length) {
+        hadFunctionCalls = true;
+        const toolCalls = chunk.functionCalls.map((fc, idx) => ({
+          index: idx,
+          id: generateOpenAIId('call'),
+          type: 'function' as const,
+          function: {
+            name: fc.name,
+            arguments: JSON.stringify(fc.args),
+          },
+        }));
+        yield `data: ${buildSSEChunk(chatId, created, model, { tool_calls: toolCalls }, null)}\n\n`;
+      }
 
-    // Emit thinking/reasoning content as a separate SSE chunk with reasoning_content field
-    // (DeepSeek/Gemini convention used by most OpenAI-compatible clients)
-    if (chunk.thinking) {
-      yield `data: ${buildSSEChunk(chatId, created, model, { reasoning_content: chunk.thinking }, null)}\n\n`;
-    }
+      // Emit inline images
+      if (chunk.images?.length) {
+        for (const img of chunk.images) {
+          yield `data: ${buildSSEChunk(chatId, created, model, {
+            content: [{ type: 'image_url', image_url: { url: `data:${img.mimeType};base64,${img.data}` } }],
+          }, null)}\n\n`;
+        }
+      }
 
-    // Emit function calls as OpenAI-format streaming tool_calls
-    // OpenAI streaming format: first chunk sends full tool_call with id/type/name + start of args,
-    // subsequent chunks send arguments incrementally.
-    // Since we get the full function call at once from gRPC, we emit:
-    //   1. A chunk with the function definition (name, id, type) and full arguments
-    //   2. The done chunk uses finish_reason: "tool_calls"
-    if (chunk.functionCalls?.length) {
-      hadFunctionCalls = true;
-      const toolCalls = chunk.functionCalls.map((fc, idx) => ({
-        index: idx,
-        id: generateOpenAIId('call'),
-        type: 'function' as const,
-        function: {
-          name: fc.name,
-          arguments: JSON.stringify(fc.args),
-        },
-      }));
-      yield `data: ${buildSSEChunk(chatId, created, model, { tool_calls: toolCalls }, null)}\n\n`;
-    }
+      if (chunk.delta) {
+        yield `data: ${buildSSEChunk(chatId, created, model, { content: chunk.delta }, null)}\n\n`;
+      }
 
-    // Emit inline images as content parts (from image-generation models)
-    if (chunk.images?.length) {
-      for (const img of chunk.images) {
-        yield `data: ${buildSSEChunk(chatId, created, model, {
-          content: [{ type: 'image_url', image_url: { url: `data:${img.mimeType};base64,${img.data}` } }],
-        }, null)}\n\n`;
+      if (chunk.done) {
+        yield `data: ${buildSSEChunk(chatId, created, model, {}, hadFunctionCalls ? 'tool_calls' : 'stop')}\n\n`;
+        yield `data: [DONE]\n\n`;
+        return;
       }
     }
 
-    if (chunk.delta) {
-      yield `data: ${buildSSEChunk(chatId, created, model, { content: chunk.delta }, null)}\n\n`;
-    }
-
-    if (chunk.done) {
-      yield `data: ${buildSSEChunk(chatId, created, model, {}, hadFunctionCalls ? 'tool_calls' : 'stop')}\n\n`;
-      yield `data: [DONE]\n\n`;
-      return;
-    }
+    // Safety: if the generator ended without a done chunk, send [DONE] anyway
+    console.warn(`[Queue] Stream generator for ${context.reqId} ended without done signal — sending [DONE]`);
+    yield `data: ${buildSSEChunk(chatId, created, model, {}, hadFunctionCalls ? 'tool_calls' : 'stop')}\n\n`;
+    yield `data: [DONE]\n\n`;
+  } finally {
+    globalThis._activeRequests = Math.max(0, (globalThis._activeRequests ?? 1) - 1);
+    evictIdleSlots().catch(() => {});
   }
-
-  // Safety: if the generator ended without a done chunk, send [DONE] anyway
-  // This prevents the client from hanging indefinitely
-  console.warn(`[Queue] Stream generator for ${context.reqId} ended without done signal — sending [DONE]`);
-  yield `data: ${buildSSEChunk(chatId, created, model, {}, hadFunctionCalls ? 'tool_calls' : 'stop')}\n\n`;
-  yield `data: [DONE]\n\n`;
 }
 
 /**
  * Get current queue status.
  */
 export function getQueueStatus(): { queueLength: number; isProcessing: boolean } {
+  const pool = getPoolStatus();
   return {
-    queueLength: globalThis._requestQueue?.length ?? 0,
-    isProcessing: globalThis._isProcessing ?? false,
+    queueLength: pool.waitingRequests,
+    isProcessing: pool.busySlots > 0,
   };
 }
 
-// ── Processing Loop ─────────────────────────────────────────────────────
+// ── Retry Logic ─────────────────────────────────────────────────────────
 
-async function processQueue(): Promise<void> {
-  if (globalThis._isProcessing) return;
-  globalThis._isProcessing = true;
-
-  try {
-    while (globalThis._requestQueue!.length > 0) {
-      const item = globalThis._requestQueue!.shift();
-      if (!item) continue;
-
-      if (item.abortSignal?.aborted) {
-        item.reject(new ClientDisconnectedError('Request aborted while queued', item.context.reqId));
-        continue;
-      }
-
-      await processItem(item);
-    }
-  } finally {
-    globalThis._isProcessing = false;
-  }
-}
-
-async function processItem(item: QueueItem): Promise<void> {
-  const { context, resolve, reject, abortSignal, streamCallback } = item;
+async function executeWithRetry(
+  ctx: RequestContext,
+  abortSignal?: AbortSignal,
+): Promise<QueueResult> {
   let lastError: Error | null = null;
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     if (abortSignal?.aborted) {
-      reject(new ClientDisconnectedError('Request aborted', context.reqId));
-      return;
+      throw new ClientDisconnectedError('Request aborted', ctx.reqId);
     }
 
     try {
-      console.log(`[Queue] Processing ${context.reqId} (attempt ${attempt}/${MAX_RETRIES})...`);
-
-      if (context.stream && streamCallback) {
-        // Streaming path: provide the generator to the caller
-        const generator = await executeStreamingRequest(context, abortSignal);
-        streamCallback(generator);
-        return;
-      } else {
-        // Non-streaming path
-        const result = await executeRequest(context);
-        resolve(result);
-        return;
-      }
+      console.log(`[Queue] Processing ${ctx.reqId} (attempt ${attempt}/${MAX_RETRIES})...`);
+      return await executeRequest(ctx);
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
-      console.error(`[Queue] Attempt ${attempt} failed for ${context.reqId}:`, lastError.message);
+      console.error(`[Queue] Attempt ${attempt} failed for ${ctx.reqId}:`, lastError.message);
+      await saveErrorSnapshot(`attempt${attempt}_${ctx.reqId}`, globalThis._currentPage);
 
-      // Save error snapshot
-      await saveErrorSnapshot(`attempt${attempt}_${context.reqId}`, globalThis._currentPage);
-
-      // Fatal errors — don't retry
-      if (isFatalError(lastError)) {
-        reject(lastError);
-        return;
-      }
+      if (isFatalError(lastError)) throw lastError;
 
       if (attempt < MAX_RETRIES) {
         if (isTier2Recoverable(lastError) || attempt >= 2) {
-          await handleTier2Recovery(context, lastError);
+          await handleTier2Recovery(ctx, lastError);
         } else {
-          await handleTier1Recovery();
+          await handleTier1Recovery(globalThis._currentPage ?? undefined);
         }
       }
     }
   }
 
-  reject(lastError ?? new Error('All retry attempts exhausted'));
+  throw lastError ?? new Error('All retry attempts exhausted');
+}
+
+async function executeStreamingWithRetry(
+  ctx: RequestContext,
+  abortSignal?: AbortSignal,
+): Promise<AsyncGenerator<StreamDelta>> {
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    if (abortSignal?.aborted) {
+      throw new ClientDisconnectedError('Request aborted', ctx.reqId);
+    }
+
+    try {
+      console.log(`[Queue] Streaming ${ctx.reqId} (attempt ${attempt}/${MAX_RETRIES})...`);
+      return await executeStreamingRequest(ctx, abortSignal);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      console.error(`[Queue] Streaming attempt ${attempt} failed for ${ctx.reqId}:`, lastError.message);
+      await saveErrorSnapshot(`attempt${attempt}_${ctx.reqId}`, globalThis._currentPage);
+
+      if (isFatalError(lastError)) throw lastError;
+
+      if (attempt < MAX_RETRIES) {
+        if (isTier2Recoverable(lastError) || attempt >= 2) {
+          await handleTier2Recovery(ctx, lastError);
+        } else {
+          await handleTier1Recovery(globalThis._currentPage ?? undefined);
+        }
+      }
+    }
+  }
+
+  throw lastError ?? new Error('All retry attempts exhausted');
 }
 
 // ── Request Execution ───────────────────────────────────────────────────
@@ -340,31 +319,42 @@ async function executeStreamingRequest(
 // ── Textarea Path (original — for single-turn) ─────────────────────────
 
 async function executeRequestViaTextarea(ctx: RequestContext): Promise<QueueResult> {
-  const { page, controller } = await preparePageForRequest(ctx);
+  const { page, controller, slot, conversationCached } = await preparePageForRequest(ctx);
 
-  // Clear previous chat
-  await controller.clearChat();
-
-  // Adjust parameters
-  await controller.adjustParameters(ctx);
-
-  // Prepare network capture for faster response extraction (non-streaming mode)
   try {
-    await controller.prepareNetworkCapture('non-streaming');
+    // Skip clearChat if conversation is cached (continuation of same chat)
+    if (!conversationCached) {
+      await controller.clearChat();
+    }
+
+    // Adjust parameters
+    await controller.adjustParameters(ctx);
+
+    // Prepare network capture for faster response extraction (non-streaming mode)
+    try {
+      await controller.prepareNetworkCapture('non-streaming');
+    } catch (error) {
+      console.warn(`[Queue] Network capture setup failed for non-streaming, will use DOM:`, error);
+    }
+
+    // Submit prompt
+    await controller.submitPrompt(ctx.prompt);
+
+    // Get response (network interception with DOM fallback)
+    const result = await controller.getResponseViaNetwork();
+
+    // Ensure generation is fully stopped before next request
+    await controller.ensureGenerationStopped();
+
+    // Update slot conversation cache — include all messages (current + response)
+    const fullHash = computeFullConversationHash(ctx.messages);
+    releaseSlot(slot, fullHash, ctx.messages?.length ?? 0, slot.currentModel);
+
+    return result;
   } catch (error) {
-    console.warn(`[Queue] Network capture setup failed for non-streaming, will use DOM:`, error);
+    releaseSlot(slot);
+    throw error;
   }
-
-  // Submit prompt
-  await controller.submitPrompt(ctx.prompt);
-
-  // Get response (network interception with DOM fallback)
-  const result = await controller.getResponseViaNetwork();
-
-  // Ensure generation is fully stopped before next request
-  await controller.ensureGenerationStopped();
-
-  return result;
 }
 
 async function executeStreamingRequestViaTextarea(
@@ -372,29 +362,40 @@ async function executeStreamingRequestViaTextarea(
   abortSignal?: AbortSignal,
 ): Promise<AsyncGenerator<StreamDelta>> {
   console.log(`[Queue] executeStreamingRequest (textarea): preparing page for ${ctx.reqId}`);
-  const { controller } = await preparePageForRequest(ctx);
-
-  await controller.clearChat();
-  await controller.adjustParameters(ctx);
+  const { controller, slot, conversationCached } = await preparePageForRequest(ctx);
 
   try {
-    await controller.prepareNetworkCapture('streaming');
-    console.log(`[Queue] executeStreamingRequest (textarea): network capture ready for ${ctx.reqId}`);
+    // Skip clearChat if conversation is cached
+    if (!conversationCached) {
+      await controller.clearChat();
+    }
+    await controller.adjustParameters(ctx);
+
+    try {
+      await controller.prepareNetworkCapture('streaming');
+      console.log(`[Queue] executeStreamingRequest (textarea): network capture ready for ${ctx.reqId}`);
+    } catch (error) {
+      console.warn(`[Queue] executeStreamingRequest (textarea): network capture setup failed:`, error);
+    }
+
+    await controller.submitPrompt(ctx.prompt);
+
+    console.log(`[Queue] executeStreamingRequest (textarea): starting stream for ${ctx.reqId}`);
+    const innerStream = controller.streamViaNetwork(abortSignal);
+
+    // Wrap to release slot when stream ends
+    return wrapStreamWithSlotRelease(innerStream, slot, ctx.messages);
   } catch (error) {
-    console.warn(`[Queue] executeStreamingRequest (textarea): network capture setup failed:`, error);
+    releaseSlot(slot);
+    throw error;
   }
-
-  await controller.submitPrompt(ctx.prompt);
-
-  console.log(`[Queue] executeStreamingRequest (textarea): starting stream for ${ctx.reqId}`);
-  return controller.streamViaNetwork(abortSignal);
 }
 
 // ── TTS Path (dedicated TTS page) ───────────────────────────────────────
 
 async function executeRequestViaTTS(ctx: RequestContext): Promise<QueueResult> {
   console.log(`[Queue] executeRequest (TTS): ${ctx.reqId}`);
-  const { page } = await preparePageForRequest(ctx, { skipModelSwitch: true });
+  const { page, slot } = await preparePageForRequest(ctx, { skipModelSwitch: true });
 
   try {
     const result = await generateSpeech(
@@ -418,6 +419,8 @@ async function executeRequestViaTTS(ctx: RequestContext): Promise<QueueResult> {
   } finally {
     // Navigate back to base page for next request
     await navigateToBasePage(page, ctx.reqId);
+    // TTS doesn't have conversation continuity
+    releaseSlot(slot, null, 0);
   }
 }
 
@@ -426,7 +429,7 @@ async function executeRequestViaTTS(ctx: RequestContext): Promise<QueueResult> {
 async function executeRequestViaInjection(ctx: RequestContext): Promise<QueueResult> {
   console.log(`[Queue] executeRequest (injection): multi-turn mode for ${ctx.reqId}`);
   // Skip model switching — injection embeds the model in PromptHistory's GenerateContentConfig
-  const { page, controller, driveCreds } = await preparePageForRequest(ctx, { skipModelSwitch: true });
+  const { page, controller, driveCreds, slot } = await preparePageForRequest(ctx, { skipModelSwitch: true });
 
   // Install prompt injection routes (images uploaded to Drive app folder)
   const { promptId, driveFileIds } = await injectPromptHistory(page, ctx, ctx.reqId, driveCreds);
@@ -447,7 +450,15 @@ async function executeRequestViaInjection(ctx: RequestContext): Promise<QueueRes
     const result = await controller.getResponseViaNetwork();
 
     await controller.ensureGenerationStopped();
+
+    // Update conversation cache
+    const fullHash = computeFullConversationHash(ctx.messages);
+    releaseSlot(slot, fullHash, ctx.messages?.length ?? 0, slot.currentModel);
+
     return result;
+  } catch (error) {
+    releaseSlot(slot);
+    throw error;
   } finally {
     // Always clean up injection routes and navigate back, even on error
     await removeInjectorRoutes(page, ctx.reqId);
@@ -465,39 +476,51 @@ async function executeStreamingRequestViaInjection(
 ): Promise<AsyncGenerator<StreamDelta>> {
   console.log(`[Queue] executeStreamingRequest (injection): multi-turn mode for ${ctx.reqId}`);
   // Skip model switching — injection embeds the model in PromptHistory's GenerateContentConfig
-  const { page, controller, driveCreds } = await preparePageForRequest(ctx, { skipModelSwitch: true });
+  const { page, controller, driveCreds, slot } = await preparePageForRequest(ctx, { skipModelSwitch: true });
 
-  // Install prompt injection routes (images uploaded to Drive app folder)
-  const { promptId, driveFileIds } = await injectPromptHistory(page, ctx, ctx.reqId, driveCreds);
-
-  // Prepare network capture BEFORE triggering generation (streaming mode)
   try {
-    await controller.prepareNetworkCapture('streaming');
-    console.log(`[Queue] executeStreamingRequest (injection): network capture ready for ${ctx.reqId}`);
+    // Install prompt injection routes (images uploaded to Drive app folder)
+    const { promptId, driveFileIds } = await injectPromptHistory(page, ctx, ctx.reqId, driveCreds);
+
+    // Prepare network capture BEFORE triggering generation (streaming mode)
+    try {
+      await controller.prepareNetworkCapture('streaming');
+      console.log(`[Queue] executeStreamingRequest (injection): network capture ready for ${ctx.reqId}`);
+    } catch (error) {
+      console.warn(`[Queue] executeStreamingRequest (injection): network capture setup failed:`, error);
+    }
+
+    // Navigate to fake prompt and click Rerun
+    // Pass temperature — it's a UI-only param not embedded in PromptHistory
+    await triggerGeneration(page, promptId, ctx.reqId, { temperature: ctx.temperature });
+
+    console.log(`[Queue] executeStreamingRequest (injection): starting stream for ${ctx.reqId}`);
+
+    // Wrap the stream to clean up injector routes, navigate back, release slot, and delete Drive files when done
+    const innerStream = controller.streamViaNetwork(abortSignal);
+    return wrapStreamWithCleanup(innerStream, page, ctx.reqId, slot, ctx.messages, {
+      driveFileIds,
+      driveCreds,
+    });
   } catch (error) {
-    console.warn(`[Queue] executeStreamingRequest (injection): network capture setup failed:`, error);
+    releaseSlot(slot);
+    throw error;
   }
-
-  // Navigate to fake prompt and click Rerun
-  // Pass temperature — it's a UI-only param not embedded in PromptHistory
-  await triggerGeneration(page, promptId, ctx.reqId, { temperature: ctx.temperature });
-
-  console.log(`[Queue] executeStreamingRequest (injection): starting stream for ${ctx.reqId}`);
-
-  // Wrap the stream to clean up injector routes, navigate back, and delete Drive files when done
-  const innerStream = controller.streamViaNetwork(abortSignal);
-  return wrapStreamWithCleanup(innerStream, page, ctx.reqId, { driveFileIds, driveCreds });
 }
 
 /**
- * Wrap a stream generator to clean up injector routes when the stream ends.
- * Also navigates back to the base page so the next request starts fresh.
- * Optionally deletes uploaded Drive files after the stream completes.
+ * Wrap a stream generator to:
+ * 1. Clean up injector routes when the stream ends
+ * 2. Navigate back to the base page
+ * 3. Release the pool slot (with conversation hash for caching)
+ * 4. Delete uploaded Drive files
  */
 async function* wrapStreamWithCleanup(
   inner: AsyncGenerator<StreamDelta>,
   page: Page,
   reqId: string,
+  slot: PageSlot,
+  messages: RequestContext['messages'],
   cleanup?: { driveFileIds?: string[]; driveCreds?: DriveAuthCredentials },
 ): AsyncGenerator<StreamDelta> {
   try {
@@ -508,6 +531,9 @@ async function* wrapStreamWithCleanup(
   } finally {
     await removeInjectorRoutes(page, reqId);
     await navigateToBasePage(page, reqId);
+    // Update conversation cache and release slot
+    const fullHash = computeFullConversationHash(messages);
+    releaseSlot(slot, fullHash, messages?.length ?? 0, slot.currentModel);
     // Delete uploaded Drive files (non-blocking cleanup)
     if (cleanup?.driveFileIds?.length) {
       deleteDriveFiles(page, cleanup.driveFileIds, reqId, cleanup.driveCreds).catch(() => {});
@@ -516,8 +542,27 @@ async function* wrapStreamWithCleanup(
 }
 
 /**
+ * Wrap a stream generator with slot release on completion (for textarea path).
+ */
+async function* wrapStreamWithSlotRelease(
+  inner: AsyncGenerator<StreamDelta>,
+  slot: PageSlot,
+  messages: RequestContext['messages'],
+): AsyncGenerator<StreamDelta> {
+  try {
+    for await (const chunk of inner) {
+      yield chunk;
+      if (chunk.done) return;
+    }
+  } finally {
+    const fullHash = computeFullConversationHash(messages);
+    releaseSlot(slot, fullHash, messages?.length ?? 0, slot.currentModel);
+  }
+}
+
+/**
  * Shared setup for both streaming and non-streaming requests:
- * get page, switch model, create controller.
+ * acquire a pool slot, get/create page, switch model, create controller.
  *
  * @param opts.skipModelSwitch - Skip UI-based model switching (injection sets model via PromptHistory)
  */
@@ -528,6 +573,8 @@ async function preparePageForRequest(
   page: Page;
   controller: PageController;
   driveCreds: DriveAuthCredentials;
+  slot: PageSlot;
+  conversationCached: boolean;
 }> {
   const account = getAccountForRequest(ctx);
   if (!account) {
@@ -544,31 +591,51 @@ async function preparePageForRequest(
     api_key?: string;
   };
 
-  const page = await getPage(parsedCreds.cookie, account.id, parsedCreds.authUser);
-  globalThis._currentPage = page;
-
-  // Build Drive auth credentials for image uploads
-  const driveCreds: DriveAuthCredentials = {
-    cookie: parsedCreds.cookie,
-    apiKey: parsedCreds.api_key || 'AIzaSyDdP816MREB3SkjZO04QXbjsigfcI0GWOs',
-    authUser: parsedCreds.authUser,
-    userAgent: parsedCreds.userAgent,
+  // Parse account-specific fingerprint and proxy config
+  const launchConfig: BrowserLaunchConfig = {
+    fingerprint: account.fingerprint ? JSON.parse(account.fingerprint) : null,
+    proxy: account.proxy ? JSON.parse(account.proxy) : null,
   };
 
-  // Check if we need to switch models (skip for injection — model is in PromptHistory)
-  if (!opts.skipModelSwitch) {
-    const currentModel = getCurrentModel();
-    const targetModel = ctx.model.startsWith('models/')
-      ? ctx.model.replace('models/', '')
-      : ctx.model;
+  // Compute conversation hash for cache matching
+  const conversationHash = computeConversationHash(ctx.messages);
 
-    if (currentModel && !currentModel.toLowerCase().includes(targetModel.split('-')[0]?.toLowerCase() ?? '')) {
-      await switchModel(page, ctx.model);
+  // Acquire a slot from the pool (may wait if all are busy)
+  const { slot, conversationCached } = await acquireSlot(account.id, conversationHash);
+
+  try {
+    // Get or create a page in this slot
+    const page = await getPageForSlot(slot, parsedCreds.cookie, account.id, parsedCreds.authUser, launchConfig);
+    globalThis._currentPage = page;
+
+    // Build Drive auth credentials for image uploads
+    const driveCreds: DriveAuthCredentials = {
+      cookie: parsedCreds.cookie,
+      apiKey: parsedCreds.api_key || 'AIzaSyDdP816MREB3SkjZO04QXbjsigfcI0GWOs',
+      authUser: parsedCreds.authUser,
+      userAgent: parsedCreds.userAgent,
+    };
+
+    // Check if we need to switch models (skip for injection — model is in PromptHistory)
+    if (!opts.skipModelSwitch && !conversationCached) {
+      const currentModel = slot.currentModel || getCurrentModel();
+      const targetModel = ctx.model.startsWith('models/')
+        ? ctx.model.replace('models/', '')
+        : ctx.model;
+
+      if (currentModel && !currentModel.toLowerCase().includes(targetModel.split('-')[0]?.toLowerCase() ?? '')) {
+        await switchModel(page, ctx.model);
+        slot.currentModel = targetModel;
+      }
     }
-  }
 
-  const controller = new PageController(page, ctx.reqId);
-  return { page, controller, driveCreds };
+    const controller = new PageController(page, ctx.reqId);
+    return { page, controller, driveCreds, slot, conversationCached };
+  } catch (error) {
+    // Release slot on preparation failure
+    releaseSlot(slot);
+    throw error;
+  }
 }
 
 // ── Navigation ──────────────────────────────────────────────────────────
@@ -598,10 +665,10 @@ async function navigateToBasePage(page: Page, reqId: string): Promise<void> {
 
 // ── Error Recovery ──────────────────────────────────────────────────────
 
-async function handleTier1Recovery(): Promise<void> {
+async function handleTier1Recovery(page?: Page): Promise<void> {
   console.log('[Queue] Tier 1 recovery: refreshing page...');
   try {
-    await refreshPage();
+    await refreshPage(page);
   } catch (error) {
     console.warn('[Queue] Tier 1 recovery failed, will try Tier 2 on next attempt:', error);
   }
@@ -635,26 +702,33 @@ async function handleTier2Recovery(_ctx: RequestContext, error: Error): Promise<
 
 // ── Account Selection ───────────────────────────────────────────────────
 
+interface AccountForRequest {
+  id: string;
+  creds: string;
+  fingerprint: string | null;
+  proxy: string | null;
+}
+
 function getAccountForRequest(
   _ctx: RequestContext,
-): { id: string; creds: string } | null {
+): AccountForRequest | null {
   const db = useDb();
 
   // Pick the least-recently-synced, non-rate-limited account
   const account = db.prepare(`
-    SELECT id, creds FROM accounts
+    SELECT id, creds, fingerprint, proxy FROM accounts
     WHERE limited_until < ?
     ORDER BY last_sync ASC
     LIMIT 1
-  `).get(Date.now()) as { id: string; creds: string } | null;
+  `).get(Date.now()) as AccountForRequest | null;
 
   if (!account) {
     // Fallback: pick any account, even if rate-limited
     const anyAccount = db.prepare(`
-      SELECT id, creds FROM accounts
+      SELECT id, creds, fingerprint, proxy FROM accounts
       ORDER BY limited_until ASC
       LIMIT 1
-    `).get() as { id: string; creds: string } | null;
+    `).get() as AccountForRequest | null;
 
     return anyAccount;
   }
