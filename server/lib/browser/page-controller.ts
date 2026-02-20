@@ -296,6 +296,11 @@ export class PageController {
           return;
         }
 
+        if (chunk.functionCalls?.length) {
+          gotAnyData = true;
+          yield { delta: '', functionCalls: chunk.functionCalls, done: false };
+        }
+
         if (chunk.images?.length) {
           gotAnyData = true;
           yield { delta: '', images: chunk.images, done: false };
@@ -348,6 +353,7 @@ export class PageController {
     let networkThinking = '';
     const networkImages: Array<{ mimeType: string; data: string }> = [];
     const networkAudio: Array<{ mimeType: string; data: string }> = [];
+    const networkFunctionCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
 
     try {
       for await (const chunk of consumeChunks(this.page, this.reqId)) {
@@ -367,6 +373,7 @@ export class PageController {
         if (chunk.thinking) networkThinking += chunk.thinking;
         if (chunk.images) networkImages.push(...chunk.images);
         if (chunk.audioChunks) networkAudio.push(...chunk.audioChunks);
+        if (chunk.functionCalls) networkFunctionCalls.push(...chunk.functionCalls);
 
         if (chunk.done) break;
       }
@@ -374,14 +381,15 @@ export class PageController {
       await endCapture(this.page);
     }
 
-    if (networkText || networkImages.length > 0 || networkAudio.length > 0) {
-      console.log(`[PageController:${this.reqId}] Got response via route (${networkText.length} chars, ${networkImages.length} images, ${networkAudio.length} audio)`);
+    if (networkText || networkImages.length > 0 || networkAudio.length > 0 || networkFunctionCalls.length > 0) {
+      console.log(`[PageController:${this.reqId}] Got response via route (${networkText.length} chars, ${networkImages.length} images, ${networkAudio.length} audio, ${networkFunctionCalls.length} function calls)`);
       return {
         text: networkText,
-        finishReason: 'stop',
+        finishReason: networkFunctionCalls.length > 0 ? 'tool_calls' : 'stop',
         thinkingText: networkThinking || undefined,
         images: networkImages.length > 0 ? networkImages : undefined,
         audioChunks: networkAudio.length > 0 ? networkAudio : undefined,
+        functionCalls: networkFunctionCalls.length > 0 ? networkFunctionCalls : undefined,
       };
     }
 

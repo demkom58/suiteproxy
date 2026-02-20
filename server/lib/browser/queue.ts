@@ -27,6 +27,7 @@ import { saveErrorSnapshot } from './snapshots';
 import { injectPromptHistory, removeInjectorRoutes, triggerGeneration } from './prompt-injector';
 import { deleteDriveFiles, type DriveAuthCredentials } from './drive-uploader';
 import { generateSpeech } from './tts-controller';
+import { logRequestUpdate } from '~~/server/utils/request-log';
 
 // ── Queue State (survives hot reloads) ──────────────────────────────────
 declare global {
@@ -118,9 +119,10 @@ export async function* enqueueStreamingRequest(
   // Now yield SSE chunks from the generator
   console.log(`[Queue] enqueueStreamingRequest: got generator, starting iteration for ${context.reqId}`);
   let chunkIndex = 0;
+  let hadFunctionCalls = false;
   for await (const chunk of streamResult) {
     chunkIndex++;
-    console.log(`[Queue] Stream chunk #${chunkIndex}: delta=${chunk.delta.length} chars, thinking=${chunk.thinking?.length ?? 0} chars, done=${chunk.done}`);
+    console.log(`[Queue] Stream chunk #${chunkIndex}: delta=${chunk.delta.length} chars, thinking=${chunk.thinking?.length ?? 0} chars, functionCalls=${chunk.functionCalls?.length ?? 0}, done=${chunk.done}`);
     if (abortSignal?.aborted) break;
 
     // Emit thinking/reasoning content as a separate SSE chunk with reasoning_content field
@@ -138,6 +140,37 @@ export async function* enqueueStreamingRequest(
         }],
       };
       yield `data: ${JSON.stringify(thinkingData)}\n\n`;
+    }
+
+    // Emit function calls as OpenAI-format streaming tool_calls
+    // OpenAI streaming format: first chunk sends full tool_call with id/type/name + start of args,
+    // subsequent chunks send arguments incrementally.
+    // Since we get the full function call at once from gRPC, we emit:
+    //   1. A chunk with the function definition (name, id, type) and full arguments
+    //   2. The done chunk uses finish_reason: "tool_calls"
+    if (chunk.functionCalls?.length) {
+      hadFunctionCalls = true;
+      const toolCalls = chunk.functionCalls.map((fc, idx) => ({
+        index: idx,
+        id: `call_${crypto.randomUUID().replace(/-/g, '').substring(0, 24)}`,
+        type: 'function' as const,
+        function: {
+          name: fc.name,
+          arguments: JSON.stringify(fc.args),
+        },
+      }));
+      const toolCallData = {
+        id: chatId,
+        object: 'chat.completion.chunk',
+        created,
+        model,
+        choices: [{
+          index: 0,
+          delta: { tool_calls: toolCalls },
+          finish_reason: null,
+        }],
+      };
+      yield `data: ${JSON.stringify(toolCallData)}\n\n`;
     }
 
     // Emit inline images as content parts (from image-generation models)
@@ -184,7 +217,7 @@ export async function* enqueueStreamingRequest(
         choices: [{
           index: 0,
           delta: {},
-          finish_reason: 'stop',
+          finish_reason: hadFunctionCalls ? 'tool_calls' : 'stop',
         }],
       };
       yield `data: ${JSON.stringify(finalData)}\n\n`;
@@ -192,6 +225,23 @@ export async function* enqueueStreamingRequest(
       return;
     }
   }
+
+  // Safety: if the generator ended without a done chunk, send [DONE] anyway
+  // This prevents the client from hanging indefinitely
+  console.warn(`[Queue] Stream generator for ${context.reqId} ended without done signal — sending [DONE]`);
+  const finalData = {
+    id: chatId,
+    object: 'chat.completion.chunk',
+    created,
+    model,
+    choices: [{
+      index: 0,
+      delta: {},
+      finish_reason: hadFunctionCalls ? 'tool_calls' : 'stop',
+    }],
+  };
+  yield `data: ${JSON.stringify(finalData)}\n\n`;
+  yield `data: [DONE]\n\n`;
 }
 
 /**
@@ -519,6 +569,9 @@ async function preparePageForRequest(
   if (!account) {
     throw new NoAccountsError(undefined, ctx.reqId);
   }
+
+  // Report the selected account to the request log
+  logRequestUpdate(ctx.reqId, { account: account.id });
 
   const parsedCreds = JSON.parse(account.creds) as {
     cookie: string;

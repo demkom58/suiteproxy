@@ -43,12 +43,21 @@ export default defineEventHandler(async (event) => {
         const fullId = String(m[0] ?? '');
         const id = fullId.split('/').pop() ?? fullId;
         const caps = getModelCapabilities(id);
+
+        // Extract paid status from raw response:
+        // field[77] === 2 → paid-only (Imagen, Veo, image-preview)
+        // field[27] === null → paid-only generation models (Imagen, Veo)
+        const field77 = m.length > 77 ? m[77] : undefined;
+        const field27 = m[27];
+        const isPaid = field77 === 2 || field27 === null;
+
         return {
           id,
           object: 'model',
           owned_by: 'google',
           description: String(m[3] ?? m[1] ?? `Google ${id} model`),
           ...caps,
+          is_paid: isPaid,
         };
       }),
     };

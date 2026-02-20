@@ -46,6 +46,13 @@ export default defineNuxtConfig({
     '@nuxtjs/tailwindcss',
   ],
 
+  // ── Tailwind ──────────────────────────────
+  tailwindcss: {
+    config: {
+      plugins: [require('@tailwindcss/typography')],
+    },
+  },
+
   // ── TypeScript ───────────────────────────────────────────────────────
   typescript: {
     strict: true,

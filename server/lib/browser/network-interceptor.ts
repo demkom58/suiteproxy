@@ -23,7 +23,7 @@
 //   - We replay the EXACT same request (same cookies, headers, auth) so Google can't tell
 
 import type { Page, BrowserContext, Route, Response as PlaywrightResponse, Request as PlaywrightRequest } from 'playwright-core';
-import type { InlineImage, InlineAudio } from './types';
+import type { InlineImage, InlineAudio, GeminiFunctionCallResult } from './types';
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -39,6 +39,8 @@ export interface StreamChunk {
   images?: InlineImage[];
   /** Inline audio returned by TTS models (base64 encoded). */
   audioChunks?: InlineAudio[];
+  /** Function calls requested by the model. */
+  functionCalls?: GeminiFunctionCallResult[];
 }
 
 interface BufferChunk extends StreamChunk {
@@ -71,6 +73,67 @@ interface ContentPart {
   isThinking: boolean;
   image?: InlineImage;
   audio?: InlineAudio;
+  functionCall?: GeminiFunctionCallResult;
+}
+
+// ── Function Call Wire Format Parser ────────────────────────────────────
+// Gemini gRPC-web response encodes function calls in positional arrays.
+// FunctionCall: [name, [[[key, valueParam], ...]]]
+// FunctionCallParameter: [null, number?, string?, bool?, object?, array?]
+//   - position 1 = number value
+//   - position 2 = string value
+//   - position 3 = bool value
+//   - position 4 = object (list of [key, FunctionCallParameter] tuples)
+//   - position 5 = array { elements: [FunctionCallParameter, ...] }
+
+function parseFunctionCallParamValue(param: unknown[]): unknown {
+  if (!Array.isArray(param)) return null;
+  // position 1: number
+  if (param[1] !== null && param[1] !== undefined && typeof param[1] === 'number') return param[1];
+  // position 2: string
+  if (param[2] !== null && param[2] !== undefined && typeof param[2] === 'string') return param[2];
+  // position 3: bool
+  if (param[3] !== null && param[3] !== undefined && typeof param[3] === 'boolean') return param[3];
+  // position 4: object (list of [key, FunctionCallParameter] tuples)
+  if (param[4] !== null && param[4] !== undefined && Array.isArray(param[4])) {
+    const obj: Record<string, unknown> = {};
+    for (const entry of param[4] as unknown[][]) {
+      if (Array.isArray(entry) && entry.length >= 2 && typeof entry[0] === 'string') {
+        obj[entry[0] as string] = parseFunctionCallParamValue(entry[1] as unknown[]);
+      }
+    }
+    return obj;
+  }
+  // position 5: array { elements: [FunctionCallParameter, ...] }
+  if (param[5] !== null && param[5] !== undefined && Array.isArray(param[5])) {
+    const arrData = param[5] as unknown[];
+    // FunctionCallParameterArray has elements at position 0
+    const elements = arrData[0];
+    if (Array.isArray(elements)) {
+      return elements.map(el => parseFunctionCallParamValue(el as unknown[]));
+    }
+    return [];
+  }
+  return null;
+}
+
+function parseFunctionCallFromWire(fcArr: unknown[]): GeminiFunctionCallResult | null {
+  if (!Array.isArray(fcArr) || fcArr.length < 1 || typeof fcArr[0] !== 'string') return null;
+
+  const name = fcArr[0] as string;
+  const args: Record<string, unknown> = {};
+
+  // fcArr[1] = tuple[list[FunctionCallArg]] = [[  [key, valueParam], [key, valueParam], ...  ]]
+  if (Array.isArray(fcArr[1]) && Array.isArray(fcArr[1][0])) {
+    const argsList = fcArr[1][0] as unknown[][];
+    for (const arg of argsList) {
+      if (Array.isArray(arg) && arg.length >= 2 && typeof arg[0] === 'string') {
+        args[arg[0] as string] = parseFunctionCallParamValue(arg[1] as unknown[]);
+      }
+    }
+  }
+
+  return { name, args };
 }
 
 function extractContentParts(
@@ -87,11 +150,18 @@ function extractContentParts(
     if (item.length >= 2 && item[0] === null && typeof item[1] === 'string') {
       const content = item[1] as string;
       if (content.length > 0) {
+        // Filter metadata strings from gRPC response — be conservative to avoid
+        // dropping real model output. Only filter obvious metadata patterns.
+        // Token/session IDs: always start with "v1_" prefix
         if (content.startsWith('v1_')) return;
-        if (content.startsWith('http')) return;
-        if (content.startsWith('models/')) return;
-        if (content.includes('.google.')) return;
-        if (content.length > 100) {
+        // Model resource names: "models/gemini-..."
+        if (content.startsWith('models/') && !content.includes(' ')) return;
+        // Google API endpoints: must be a pure URL (no spaces = not prose)
+        if (content.startsWith('http') && !content.includes(' ')) return;
+        // Google internal domains: only filter if it looks like a bare domain/URL (no spaces)
+        if (content.includes('.google.') && !content.includes(' ')) return;
+        // Base64 data blobs: long strings of only base64 characters
+        if (content.length > 200) {
           const cleaned = content.replace(/\s/g, '');
           if (/^[A-Za-z0-9+/=_-]+$/.test(cleaned)) return;
         }
@@ -128,6 +198,23 @@ function extractContentParts(
       }
     }
 
+    // Function call part pattern (GeneratePart positional format):
+    // Position 10 = FunctionCall: ["function_name", [[[key, valueParam], ...]]]
+    // where valueParam = [null, number?, string?, bool?, object?, array?]
+    // Detected by: array length >= 11, item[10] is array, item[10][0] is string (name)
+    if (
+      item.length >= 11
+      && item[0] === null
+      && Array.isArray(item[10])
+      && typeof item[10][0] === 'string'
+    ) {
+      const fc = parseFunctionCallFromWire(item[10] as unknown[]);
+      if (fc) {
+        results.push({ text: '', isThinking: false, functionCall: fc });
+        return;
+      }
+    }
+
     for (let i = 0; i < item.length; i++) {
       if (Array.isArray(item[i])) walk(item[i], depth + 1);
     }
@@ -143,7 +230,7 @@ function extractTextParts(
   maxDepth = 20,
 ): Array<{ text: string; isThinking: boolean }> {
   return extractContentParts(arr, maxDepth)
-    .filter(p => !p.image)
+    .filter(p => !p.image && !p.functionCall)
     .map(p => ({ text: p.text, isThinking: p.isThinking }));
 }
 
@@ -192,32 +279,38 @@ function findNewCompleteParts(fullText: string, state: IncrementalParserState): 
 function parseIncrementalChunks(
   fullText: string,
   state: IncrementalParserState,
-): { text: string; thinking: string } {
+): { text: string; thinking: string; images: InlineImage[]; audioChunks: InlineAudio[]; functionCalls: GeminiFunctionCallResult[] } {
   let text = '';
   let thinking = '';
+  const images: InlineImage[] = [];
+  const audioChunks: InlineAudio[] = [];
+  const functionCalls: GeminiFunctionCallResult[] = [];
 
   const newParts = findNewCompleteParts(fullText, state);
   for (const part of newParts) {
     try {
       const parsed: unknown = JSON.parse(part);
       if (Array.isArray(parsed)) {
-        const extracted = extractTextParts(parsed);
+        const extracted = extractContentParts(parsed);
         for (const item of extracted) {
-          if (item.isThinking) thinking += item.text;
+          if (item.functionCall) functionCalls.push(item.functionCall);
+          else if (item.image) images.push(item.image);
+          else if (item.audio) audioChunks.push(item.audio);
+          else if (item.isThinking) thinking += item.text;
           else text += item.text;
         }
       }
     } catch { /* incomplete JSON — skip */ }
   }
-  return { text, thinking };
+  return { text, thinking, images, audioChunks, functionCalls };
 }
 
 /**
  * Parse complete response body into chunks (for non-streaming).
- * Extracts text, thinking content, and inline images.
+ * Extracts text, thinking content, inline images, and function calls.
  */
-function parseResponseChunks(body: string): Array<{ text: string; thinking: string; images?: InlineImage[]; audioChunks?: InlineAudio[] }> {
-  const chunks: Array<{ text: string; thinking: string; images?: InlineImage[] }> = [];
+function parseResponseChunks(body: string): Array<{ text: string; thinking: string; images?: InlineImage[]; audioChunks?: InlineAudio[]; functionCalls?: GeminiFunctionCallResult[] }> {
+  const chunks: Array<{ text: string; thinking: string; images?: InlineImage[]; audioChunks?: InlineAudio[]; functionCalls?: GeminiFunctionCallResult[] }> = [];
   try {
     const outer: unknown = JSON.parse(body);
     if (!Array.isArray(outer) || outer.length === 0) return chunks;
@@ -232,8 +325,11 @@ function parseResponseChunks(body: string): Array<{ text: string; thinking: stri
       let chunkThinking = '';
       const chunkImages: InlineImage[] = [];
       const chunkAudio: InlineAudio[] = [];
+      const chunkFunctionCalls: GeminiFunctionCallResult[] = [];
       for (const part of parts) {
-        if (part.image) {
+        if (part.functionCall) {
+          chunkFunctionCalls.push(part.functionCall);
+        } else if (part.image) {
           chunkImages.push(part.image);
         } else if (part.audio) {
           chunkAudio.push(part.audio);
@@ -243,12 +339,13 @@ function parseResponseChunks(body: string): Array<{ text: string; thinking: stri
           chunkText += part.text;
         }
       }
-      if (chunkText || chunkThinking || chunkImages.length > 0 || chunkAudio.length > 0) {
+      if (chunkText || chunkThinking || chunkImages.length > 0 || chunkAudio.length > 0 || chunkFunctionCalls.length > 0) {
         chunks.push({
           text: chunkText,
           thinking: chunkThinking,
           ...(chunkImages.length > 0 ? { images: chunkImages } : {}),
           ...(chunkAudio.length > 0 ? { audioChunks: chunkAudio } : {}),
+          ...(chunkFunctionCalls.length > 0 ? { functionCalls: chunkFunctionCalls } : {}),
         });
       }
     }
@@ -309,10 +406,11 @@ async function replayAndStream(
       fullResponseBody = body;
       const parsed = parseResponseChunks(body);
       for (const chunk of parsed) {
-        if (chunk.text || chunk.thinking || chunk.images?.length || chunk.audioChunks?.length) {
+        if (chunk.text || chunk.thinking || chunk.images?.length || chunk.audioChunks?.length || chunk.functionCalls?.length) {
           chunkBuffer.push({
             text: chunk.text, thinking: chunk.thinking,
             images: chunk.images, audioChunks: chunk.audioChunks,
+            functionCalls: chunk.functionCalls,
             done: false, reqId, timestamp: Date.now(), source: 'replay',
           });
         }
@@ -324,6 +422,11 @@ async function replayAndStream(
       const decoder = new TextDecoder();
       const parserState: IncrementalParserState = { parsedChunkCount: 0 };
       let accumulated = '';
+      let streamedText = '';
+      let streamedThinking = '';
+      const streamedImages: InlineImage[] = [];
+      const streamedAudio: InlineAudio[] = [];
+      const streamedFunctionCalls: GeminiFunctionCallResult[] = [];
 
       while (true) {
         const { done, value } = await reader.read();
@@ -336,9 +439,17 @@ async function replayAndStream(
 
         // Parse any new complete chunks from the accumulated text
         const result = parseIncrementalChunks(accumulated, parserState);
-        if (result.text || result.thinking) {
+        if (result.text || result.thinking || result.images.length || result.audioChunks.length || result.functionCalls.length) {
+          streamedText += result.text;
+          streamedThinking += result.thinking;
+          streamedImages.push(...result.images);
+          streamedAudio.push(...result.audioChunks);
+          streamedFunctionCalls.push(...result.functionCalls);
           chunkBuffer.push({
             text: result.text, thinking: result.thinking,
+            images: result.images.length > 0 ? result.images : undefined,
+            audioChunks: result.audioChunks.length > 0 ? result.audioChunks : undefined,
+            functionCalls: result.functionCalls.length > 0 ? result.functionCalls : undefined,
             done: false, reqId, timestamp: Date.now(), source: 'replay',
           });
         }
@@ -347,14 +458,67 @@ async function replayAndStream(
       // Final decode flush
       accumulated += decoder.decode().replace(/\0/g, '');
       const finalResult = parseIncrementalChunks(accumulated, parserState);
-      if (finalResult.text || finalResult.thinking) {
+      if (finalResult.text || finalResult.thinking || finalResult.images.length || finalResult.audioChunks.length || finalResult.functionCalls.length) {
+        streamedText += finalResult.text;
+        streamedThinking += finalResult.thinking;
+        streamedImages.push(...finalResult.images);
+        streamedAudio.push(...finalResult.audioChunks);
+        streamedFunctionCalls.push(...finalResult.functionCalls);
         chunkBuffer.push({
           text: finalResult.text, thinking: finalResult.thinking,
+          images: finalResult.images.length > 0 ? finalResult.images : undefined,
+          audioChunks: finalResult.audioChunks.length > 0 ? finalResult.audioChunks : undefined,
+          functionCalls: finalResult.functionCalls.length > 0 ? finalResult.functionCalls : undefined,
           done: false, reqId, timestamp: Date.now(), source: 'replay',
         });
       }
 
       fullResponseBody = accumulated;
+
+      // ── Safety fallback: full parse comparison ──
+      // The incremental parser may miss content that the full parser catches.
+      // Do a complete parse of the accumulated response and check for missing content.
+      const fullParsed = parseResponseChunks(accumulated);
+      let fullText = '';
+      let fullThinking = '';
+      const fullImages: InlineImage[] = [];
+      const fullAudio: InlineAudio[] = [];
+      const fullFunctionCalls: GeminiFunctionCallResult[] = [];
+      for (const chunk of fullParsed) {
+        fullText += chunk.text;
+        fullThinking += chunk.thinking;
+        if (chunk.images) fullImages.push(...chunk.images);
+        if (chunk.audioChunks) fullAudio.push(...chunk.audioChunks);
+        if (chunk.functionCalls) fullFunctionCalls.push(...chunk.functionCalls);
+      }
+
+      // If the full parser found more content than the incremental parser,
+      // push the MISSING content as a final chunk before done.
+      const missingText = fullText.length > streamedText.length
+        ? fullText.substring(streamedText.length)
+        : '';
+      const missingThinking = fullThinking.length > streamedThinking.length
+        ? fullThinking.substring(streamedThinking.length)
+        : '';
+      const missingImages = fullImages.slice(streamedImages.length);
+      const missingAudio = fullAudio.slice(streamedAudio.length);
+      const missingFunctionCalls = fullFunctionCalls.slice(streamedFunctionCalls.length);
+
+      if (missingText || missingThinking || missingImages.length || missingAudio.length || missingFunctionCalls.length) {
+        console.warn(
+          `[NetworkInterceptor:${reqId}] Fallback parser recovered missing content: ` +
+          `text=${missingText.length} chars, thinking=${missingThinking.length} chars, ` +
+          `images=${missingImages.length}, audio=${missingAudio.length}, functionCalls=${missingFunctionCalls.length}`,
+        );
+        chunkBuffer.push({
+          text: missingText, thinking: missingThinking,
+          images: missingImages.length > 0 ? missingImages : undefined,
+          audioChunks: missingAudio.length > 0 ? missingAudio : undefined,
+          functionCalls: missingFunctionCalls.length > 0 ? missingFunctionCalls : undefined,
+          done: false, reqId, timestamp: Date.now(), source: 'replay',
+        });
+      }
+
       chunkBuffer.push({ text: '', done: true, reqId, timestamp: Date.now(), source: 'replay' });
     }
 
@@ -447,12 +611,13 @@ async function handleGenerateContentResponse(response: PlaywrightResponse, reqId
     if (status >= 200 && status < 300) {
       const parsedChunks = parseResponseChunks(bodyText);
       for (const chunk of parsedChunks) {
-        if (chunk.text || chunk.thinking || chunk.images?.length || chunk.audioChunks?.length) {
+        if (chunk.text || chunk.thinking || chunk.images?.length || chunk.audioChunks?.length || chunk.functionCalls?.length) {
           chunkBuffer.push({
             text: chunk.text,
             thinking: chunk.thinking,
             images: chunk.images,
             audioChunks: chunk.audioChunks,
+            functionCalls: chunk.functionCalls,
             done: false,
             reqId,
             timestamp: Date.now(),
@@ -592,7 +757,8 @@ export async function* consumeStreamingChunks(
 
     for (const chunk of matchingChunks) {
       if (chunk.error) { yield { text: '', done: true, error: chunk.error }; return; }
-      if (chunk.done && !chunk.text && !chunk.thinking && !chunk.images?.length && !chunk.audioChunks?.length) { yield { text: '', done: true }; return; }
+      if (chunk.done && !chunk.text && !chunk.thinking && !chunk.images?.length && !chunk.audioChunks?.length && !chunk.functionCalls?.length) { yield { text: '', done: true }; return; }
+      if (chunk.functionCalls?.length) { gotAnyData = true; yield { text: '', functionCalls: chunk.functionCalls, done: false }; }
       if (chunk.images?.length) { gotAnyData = true; yield { text: '', images: chunk.images, done: false }; }
       if (chunk.audioChunks?.length) { gotAnyData = true; yield { text: '', audioChunks: chunk.audioChunks, done: false }; }
       if (chunk.text) { gotAnyData = true; yield { text: chunk.text, done: false }; }
@@ -652,7 +818,8 @@ export async function* consumeChunks(
 
     for (const chunk of matchingChunks) {
       if (chunk.error) { yield { text: '', done: true, error: chunk.error }; return; }
-      if (chunk.done && !chunk.text && !chunk.thinking && !chunk.images?.length && !chunk.audioChunks?.length) { yield { text: '', done: true }; return; }
+      if (chunk.done && !chunk.text && !chunk.thinking && !chunk.images?.length && !chunk.audioChunks?.length && !chunk.functionCalls?.length) { yield { text: '', done: true }; return; }
+      if (chunk.functionCalls?.length) { gotAnyData = true; yield { text: '', functionCalls: chunk.functionCalls, done: false }; }
       if (chunk.images?.length) { gotAnyData = true; yield { text: '', images: chunk.images, done: false }; }
       if (chunk.audioChunks?.length) { gotAnyData = true; yield { text: '', audioChunks: chunk.audioChunks, done: false }; }
       if (chunk.text) { gotAnyData = true; yield { text: chunk.text, done: false }; }

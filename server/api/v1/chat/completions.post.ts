@@ -33,6 +33,7 @@ import {
   NoAccountsError,
   ClientDisconnectedError,
 } from '~~/server/lib/browser/errors';
+import { logRequestStart, logRequestEnd, logRequestUpdate } from '~~/server/utils/request-log';
 
 // ── Model Aliases ───────────────────────────────────────────────────────
 const MODEL_ALIASES: Record<string, string> = {
@@ -106,6 +107,24 @@ export default defineEventHandler(async (event) => {
       : undefined,
   };
 
+  // ── Request Logging ──────────────────────────────────────────────────
+  const features: string[] = [];
+  if (toolConfig.enableGoogleSearch) features.push('search');
+  if (toolConfig.enableUrlContext) features.push('url_context');
+  if (toolConfig.enableCodeExecution) features.push('code_exec');
+  if (toolConfig.functionDeclarations.length > 0) features.push('functions');
+  if (responseFormat) features.push(responseFormat.type);
+  if (imageCapable) features.push('image_gen');
+  logRequestStart({
+    id: reqId,
+    method: 'POST',
+    path: '/v1/chat/completions',
+    model: resolvedModel,
+    stream: body.stream ?? false,
+    features,
+    account: null, // account is selected later in the queue
+  });
+
   // ── Streaming Path ──────────────────────────────────────────────────
   if (body.stream) {
     setResponseHeaders(event, {
@@ -119,13 +138,16 @@ export default defineEventHandler(async (event) => {
     const stream = new ReadableStream({
       async start(controller) {
         try {
+          logRequestUpdate(reqId, { status: 'streaming' });
           console.log(`[Completions:${reqId}] ReadableStream started, iterating generator...`);
           for await (const chunk of enqueueStreamingRequest(context)) {
             console.log(`[Completions:${reqId}] Streaming chunk: ${chunk.length} bytes`);
             controller.enqueue(new TextEncoder().encode(chunk));
           }
+          logRequestEnd(reqId, { statusCode: 200 });
         } catch (error) {
           const errMsg = error instanceof Error ? error.message : String(error);
+          logRequestEnd(reqId, { statusCode: 500, error: errMsg });
           console.error(`[Completions:${reqId}] Stream error:`, errMsg);
 
           // Send error as SSE event
@@ -195,6 +217,12 @@ export default defineEventHandler(async (event) => {
       },
     };
 
+    logRequestEnd(reqId, {
+      statusCode: 200,
+      inputTokens: promptTokens,
+      outputTokens: completionTokens,
+    });
+
     setResponseHeader(event, 'X-Request-Id', reqId);
     return response;
 
@@ -202,32 +230,18 @@ export default defineEventHandler(async (event) => {
     const msg = error instanceof Error ? error.message : String(error);
     console.error(`[Completions:${reqId}] Error:`, msg);
 
+    let statusCode = 502;
     // Map typed errors to HTTP status codes
-    if (error instanceof AuthenticationError) {
-      throw createError({ statusCode: 401, statusMessage: msg });
-    }
-    if (error instanceof RateLimitError) {
-      throw createError({ statusCode: 429, statusMessage: msg });
-    }
-    if (error instanceof NoAccountsError) {
-      throw createError({ statusCode: 503, statusMessage: msg });
-    }
-    if (error instanceof ClientDisconnectedError) {
-      throw createError({ statusCode: 499, statusMessage: msg });
-    }
+    if (error instanceof AuthenticationError) statusCode = 401;
+    else if (error instanceof RateLimitError) statusCode = 429;
+    else if (error instanceof NoAccountsError) statusCode = 503;
+    else if (error instanceof ClientDisconnectedError) statusCode = 499;
+    else if (msg.includes('expired') || msg.includes('login') || msg.includes('auth')) statusCode = 401;
+    else if (msg.includes('rate limit') || msg.includes('429') || msg.includes('quota')) statusCode = 429;
+    else if (msg.includes('No available account') || msg.includes('No accounts')) statusCode = 503;
 
-    // Fallback: string-based matching for non-typed errors
-    if (msg.includes('expired') || msg.includes('login') || msg.includes('auth')) {
-      throw createError({ statusCode: 401, statusMessage: msg });
-    }
-    if (msg.includes('rate limit') || msg.includes('429') || msg.includes('quota')) {
-      throw createError({ statusCode: 429, statusMessage: msg });
-    }
-    if (msg.includes('No available account') || msg.includes('No accounts')) {
-      throw createError({ statusCode: 503, statusMessage: 'No accounts available. Please sync an account first.' });
-    }
-
-    throw createError({ statusCode: 502, statusMessage: msg });
+    logRequestEnd(reqId, { statusCode, error: msg });
+    throw createError({ statusCode, statusMessage: msg });
   }
 });
 
