@@ -17,6 +17,7 @@
  */
 import type { OpenAIAudioTranscriptionResponse } from '~~/server/types/openai';
 import { getGoogleApiCredentials, callGeminiRestApi } from '~~/server/utils/google-api';
+import { getErrorMessage } from '~~/server/utils/helpers';
 
 // ── Model Aliases ───────────────────────────────────────────────────────
 const TRANSCRIPTION_MODEL_ALIASES: Record<string, string> = {
@@ -164,7 +165,7 @@ export default defineEventHandler(async (event) => {
     if (error && typeof error === 'object' && 'statusCode' in error) {
       throw error;
     }
-    const msg = error instanceof Error ? error.message : String(error);
+    const msg = getErrorMessage(error);
     console.error(`[Transcription] Error:`, msg);
     throw createError({ statusCode: 502, statusMessage: msg });
   }

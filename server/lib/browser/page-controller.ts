@@ -754,7 +754,7 @@ export class PageController {
         if (errorToast) {
           const toastText = await this.page.locator(S.ERROR_TOAST).first().innerText({ timeout: 1_000 }).catch(() => '');
           if (toastText.toLowerCase().includes('rate limit') || toastText.toLowerCase().includes('quota')) {
-            throw new RateLimitError(toastText);
+            throw new RateLimitError(undefined, toastText);
           }
           if (toastText.length > 0) {
             throw new Error(`AI Studio error: ${toastText}`);
@@ -837,7 +837,7 @@ export class PageController {
       if (result.error) {
         const errorLower = result.error.toLowerCase();
         if (errorLower.includes('rate limit') || errorLower.includes('quota')) {
-          throw new RateLimitError(result.error);
+          throw new RateLimitError(undefined, result.error);
         }
         if (errorLower.includes('internal error') || errorLower.includes('error')) {
           throw new Error(`AI Studio error: ${result.error}`);

@@ -16,6 +16,7 @@ import { cookieToStorageState } from './auth-converter';
 import { AI_STUDIO_NEW_CHAT, AI_STUDIO_URL_PATTERN, PROMPT_TEXTAREA, INPUT_WRAPPER } from './selectors';
 import { AuthenticationError, BrowserNotInitializedError, PageNotReadyError } from './errors';
 import { installInterceptorOnContext, resetInterceptorState } from './network-interceptor';
+import { getErrorMessage } from '~~/server/utils/helpers';
 import { clearTokenCache } from './drive-uploader';
 
 // ── Global state (survives hot reloads) ─────────────────────────────────
@@ -209,7 +210,7 @@ async function launchCamoufox(isWindows: boolean, isLinux: boolean): Promise<Bro
     console.log('[Browser] Camoufox launched via high-level API');
     return browser as Browser;
   } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
+    const msg = getErrorMessage(error);
     const stack = error instanceof Error ? error.stack?.substring(0, 500) : '';
     console.warn(`[Browser] High-level Camoufox() failed: ${msg}`);
     if (stack) console.warn(`[Browser] Stack: ${stack}`);
@@ -246,7 +247,7 @@ async function launchCamoufox(isWindows: boolean, isLinux: boolean): Promise<Bro
     console.log('[Browser] Camoufox launched via manual launch');
     return browser;
   } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
+    const msg = getErrorMessage(error);
     const stack = error instanceof Error ? error.stack?.substring(0, 500) : '';
     console.error(`[Browser] Manual launch also failed: ${msg}`);
     if (stack) console.error(`[Browser] Stack: ${stack}`);

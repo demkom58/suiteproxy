@@ -20,6 +20,7 @@ import {
   RateLimitError,
   NoAccountsError,
 } from '~~/server/lib/browser/errors';
+import { getErrorMessage } from '~~/server/utils/helpers';
 
 // ── Model Aliases ───────────────────────────────────────────────────────
 const IMAGE_EDIT_MODEL_ALIASES: Record<string, string> = {
@@ -178,7 +179,7 @@ export default defineEventHandler(async (event) => {
       throw error;
     }
 
-    const msg = error instanceof Error ? error.message : String(error);
+    const msg = getErrorMessage(error);
     console.error(`[ImageEdit:${reqId}] Error:`, msg);
 
     if (error instanceof AuthenticationError) {

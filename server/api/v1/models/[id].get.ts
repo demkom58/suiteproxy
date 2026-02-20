@@ -6,6 +6,8 @@
  *
  * Proxies the request to the models list endpoint and filters by ID.
  */
+import { getErrorMessage } from '~~/server/utils/helpers';
+
 export default defineEventHandler(async (event) => {
   const modelId = getRouterParam(event, 'id');
 
@@ -43,7 +45,7 @@ export default defineEventHandler(async (event) => {
       throw error;
     }
 
-    const msg = error instanceof Error ? error.message : String(error);
+    const msg = getErrorMessage(error);
     console.error(`[ModelGet] Error fetching model ${modelId}:`, msg);
     throw createError({ statusCode: 502, statusMessage: msg });
   }

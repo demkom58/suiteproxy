@@ -11,6 +11,7 @@ import type { Page } from 'playwright-core';
 import { AI_STUDIO_NEW_CHAT, MODEL_NAME, INPUT_WRAPPER, PROMPT_TEXTAREA } from './selectors';
 import { setCurrentModel } from './index';
 import { ModelSwitchError } from './errors';
+import { getErrorMessage } from '~~/server/utils/helpers';
 
 /**
  * Switch the AI Studio model to the specified model ID.
@@ -82,7 +83,7 @@ export async function switchModel(page: Page, targetModel: string): Promise<stri
 
     // Wrap in ModelSwitchError if not already
     if (error instanceof ModelSwitchError) throw error;
-    const msg = error instanceof Error ? error.message : String(error);
+    const msg = getErrorMessage(error);
     throw new ModelSwitchError(fullModelId, msg);
   }
 }

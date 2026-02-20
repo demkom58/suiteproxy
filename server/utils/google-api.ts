@@ -75,18 +75,17 @@ export async function buildGoogleApiHeaders(creds: GoogleApiCredentials): Promis
 }
 
 /**
- * Call a MakerSuiteService RPC endpoint with SAPISID auth.
+ * Fetch with authUser retry — retries with authUser=0 if the stored authUser returns 401/403.
+ * Shared implementation for both MakerSuiteRpc and Gemini REST API calls.
  */
-export async function callMakerSuiteRpc(
-  endpoint: string,
+async function fetchWithAuthRetry(
+  url: string,
   body: unknown,
   creds: GoogleApiCredentials,
+  buildHeaders: (c: GoogleApiCredentials) => Promise<Record<string, string>>,
+  label: string,
 ): Promise<Response> {
-  const url = `https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/${endpoint}`;
-  const headers = await buildGoogleApiHeaders(creds);
-  headers['X-User-Agent'] = 'grpc-web-javascript/0.1';
-  headers['X-Goog-Ext-519733851-bin'] = 'CAASA1JVQRgBMAE4BEAA';
-  headers['Content-Type'] = 'application/json+protobuf';
+  const headers = await buildHeaders(creds);
 
   const response = await fetch(url, {
     method: 'POST',
@@ -94,15 +93,9 @@ export async function callMakerSuiteRpc(
     body: JSON.stringify(body),
   });
 
-  // Retry with authUser=0 if auth fails
   if ((response.status === 401 || response.status === 403) && creds.authUser !== '0') {
-    console.warn(`[MakerSuiteRPC] AuthUser ${creds.authUser} failed (${response.status}). Retrying with 0...`);
-    const retryCreds = { ...creds, authUser: '0' };
-    const retryHeaders = await buildGoogleApiHeaders(retryCreds);
-    retryHeaders['X-User-Agent'] = 'grpc-web-javascript/0.1';
-    retryHeaders['X-Goog-Ext-519733851-bin'] = 'CAASA1JVQRgBMAE4BEAA';
-    retryHeaders['Content-Type'] = 'application/json+protobuf';
-
+    console.warn(`[${label}] AuthUser ${creds.authUser} failed (${response.status}). Retrying with 0...`);
+    const retryHeaders = await buildHeaders({ ...creds, authUser: '0' });
     return fetch(url, {
       method: 'POST',
       headers: retryHeaders,
@@ -111,6 +104,25 @@ export async function callMakerSuiteRpc(
   }
 
   return response;
+}
+
+/**
+ * Call a MakerSuiteService RPC endpoint with SAPISID auth.
+ */
+export async function callMakerSuiteRpc(
+  endpoint: string,
+  body: unknown,
+  creds: GoogleApiCredentials,
+): Promise<Response> {
+  const url = `https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/${endpoint}`;
+
+  return fetchWithAuthRetry(url, body, creds, async (c) => {
+    const headers = await buildGoogleApiHeaders(c);
+    headers['X-User-Agent'] = 'grpc-web-javascript/0.1';
+    headers['X-Goog-Ext-519733851-bin'] = 'CAASA1JVQRgBMAE4BEAA';
+    headers['Content-Type'] = 'application/json+protobuf';
+    return headers;
+  }, 'MakerSuiteRPC');
 }
 
 /**
@@ -124,26 +136,5 @@ export async function callGeminiRestApi(
   creds: GoogleApiCredentials,
 ): Promise<Response> {
   const url = `https://generativelanguage.googleapis.com/v1beta/${path}`;
-  const headers = await buildGoogleApiHeaders(creds);
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-  });
-
-  // Retry with authUser=0 if auth fails
-  if ((response.status === 401 || response.status === 403) && creds.authUser !== '0') {
-    console.warn(`[GoogleAPI] AuthUser ${creds.authUser} failed (${response.status}). Retrying with 0...`);
-    const retryCreds = { ...creds, authUser: '0' };
-    const retryHeaders = await buildGoogleApiHeaders(retryCreds);
-
-    return fetch(url, {
-      method: 'POST',
-      headers: retryHeaders,
-      body: JSON.stringify(body),
-    });
-  }
-
-  return response;
+  return fetchWithAuthRetry(url, body, creds, buildGoogleApiHeaders, 'GoogleAPI');
 }

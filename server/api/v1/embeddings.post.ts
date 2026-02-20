@@ -12,6 +12,7 @@
  */
 import type { OpenAIEmbeddingsRequest, OpenAIEmbeddingsResponse } from '~~/server/types/openai';
 import { getGoogleApiCredentials, callGeminiRestApi, type GoogleApiCredentials } from '~~/server/utils/google-api';
+import { getErrorMessage } from '~~/server/utils/helpers';
 
 // ── Model Aliases ───────────────────────────────────────────────────────
 const MODEL_ALIASES: Record<string, string> = {
@@ -92,7 +93,7 @@ export default defineEventHandler(async (event) => {
     if (error && typeof error === 'object' && 'statusCode' in error) {
       throw error;
     }
-    const msg = error instanceof Error ? error.message : String(error);
+    const msg = getErrorMessage(error);
     console.error(`[Embeddings] Error:`, msg);
     throw createError({ statusCode: 502, statusMessage: msg });
   }

@@ -6,6 +6,7 @@
  * Many OpenAI SDKs call this automatically — we need it to not error.
  */
 import type { OpenAIModerationsRequest, OpenAIModerationsResponse } from '~~/server/types/openai';
+import { generateOpenAIId } from '~~/server/utils/helpers';
 
 // All moderation categories from the OpenAI spec
 const CATEGORIES = [
@@ -43,7 +44,7 @@ export default defineEventHandler(async (event) => {
   }
 
   const response: OpenAIModerationsResponse = {
-    id: `modr-${crypto.randomUUID().replace(/-/g, '').substring(0, 24)}`,
+    id: generateOpenAIId('modr'),
     model: body.model ?? 'text-moderation-latest',
     results: inputs.map(() => ({
       flagged: false,

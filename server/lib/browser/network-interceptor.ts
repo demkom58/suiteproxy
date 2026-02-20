@@ -24,6 +24,7 @@
 
 import type { Page, BrowserContext, Route, Response as PlaywrightResponse, Request as PlaywrightRequest } from 'playwright-core';
 import type { InlineImage, InlineAudio, GeminiFunctionCallResult } from './types';
+import { getErrorMessage } from '~~/server/utils/helpers';
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -59,6 +60,56 @@ let routeInstalled = false;
 
 // Signals that the route handler saw the request go through
 let routeFired = false;
+
+// ── Helpers ─────────────────────────────────────────────────────────────
+
+/** Push a chunk to the shared buffer with consistent conditional spreading. */
+function pushChunk(
+  reqId: string,
+  source: 'replay' | 'response',
+  data: {
+    text?: string; thinking?: string; done?: boolean; error?: string;
+    images?: InlineImage[]; audioChunks?: InlineAudio[]; functionCalls?: GeminiFunctionCallResult[];
+  },
+): void {
+  chunkBuffer.push({
+    text: data.text ?? '',
+    thinking: data.thinking,
+    images: data.images?.length ? data.images : undefined,
+    audioChunks: data.audioChunks?.length ? data.audioChunks : undefined,
+    functionCalls: data.functionCalls?.length ? data.functionCalls : undefined,
+    done: data.done ?? false,
+    error: data.error,
+    reqId,
+    timestamp: Date.now(),
+    source,
+  });
+}
+
+/** Categorize extracted content parts into typed buckets. */
+function categorizeContentParts(parts: ContentPart[]): {
+  text: string; thinking: string;
+  images: InlineImage[]; audioChunks: InlineAudio[]; functionCalls: GeminiFunctionCallResult[];
+} {
+  let text = '';
+  let thinking = '';
+  const images: InlineImage[] = [];
+  const audioChunks: InlineAudio[] = [];
+  const functionCalls: GeminiFunctionCallResult[] = [];
+  for (const part of parts) {
+    if (part.functionCall) functionCalls.push(part.functionCall);
+    else if (part.image) images.push(part.image);
+    else if (part.audio) audioChunks.push(part.audio);
+    else if (part.isThinking) thinking += part.text;
+    else text += part.text;
+  }
+  return { text, thinking, images, audioChunks, functionCalls };
+}
+
+/** Check if categorized content has any meaningful data. */
+function hasContent(c: { text: string; thinking: string; images: InlineImage[]; audioChunks: InlineAudio[]; functionCalls: GeminiFunctionCallResult[] }): boolean {
+  return !!(c.text || c.thinking || c.images.length || c.audioChunks.length || c.functionCalls.length);
+}
 
 // ── Incremental streaming parser ────────────────────────────────────────
 // Parses the gRPC-web response format: [[chunk1, chunk2, ...]]
@@ -280,29 +331,17 @@ function parseIncrementalChunks(
   fullText: string,
   state: IncrementalParserState,
 ): { text: string; thinking: string; images: InlineImage[]; audioChunks: InlineAudio[]; functionCalls: GeminiFunctionCallResult[] } {
-  let text = '';
-  let thinking = '';
-  const images: InlineImage[] = [];
-  const audioChunks: InlineAudio[] = [];
-  const functionCalls: GeminiFunctionCallResult[] = [];
-
+  const allParts: ContentPart[] = [];
   const newParts = findNewCompleteParts(fullText, state);
   for (const part of newParts) {
     try {
       const parsed: unknown = JSON.parse(part);
       if (Array.isArray(parsed)) {
-        const extracted = extractContentParts(parsed);
-        for (const item of extracted) {
-          if (item.functionCall) functionCalls.push(item.functionCall);
-          else if (item.image) images.push(item.image);
-          else if (item.audio) audioChunks.push(item.audio);
-          else if (item.isThinking) thinking += item.text;
-          else text += item.text;
-        }
+        allParts.push(...extractContentParts(parsed));
       }
     } catch { /* incomplete JSON — skip */ }
   }
-  return { text, thinking, images, audioChunks, functionCalls };
+  return categorizeContentParts(allParts);
 }
 
 /**
@@ -321,31 +360,14 @@ function parseResponseChunks(body: string): Array<{ text: string; thinking: stri
       if (!Array.isArray(chunk)) continue;
 
       const parts = extractContentParts(chunk);
-      let chunkText = '';
-      let chunkThinking = '';
-      const chunkImages: InlineImage[] = [];
-      const chunkAudio: InlineAudio[] = [];
-      const chunkFunctionCalls: GeminiFunctionCallResult[] = [];
-      for (const part of parts) {
-        if (part.functionCall) {
-          chunkFunctionCalls.push(part.functionCall);
-        } else if (part.image) {
-          chunkImages.push(part.image);
-        } else if (part.audio) {
-          chunkAudio.push(part.audio);
-        } else if (part.isThinking) {
-          chunkThinking += part.text;
-        } else {
-          chunkText += part.text;
-        }
-      }
-      if (chunkText || chunkThinking || chunkImages.length > 0 || chunkAudio.length > 0 || chunkFunctionCalls.length > 0) {
+      const c = categorizeContentParts(parts);
+      if (hasContent(c)) {
         chunks.push({
-          text: chunkText,
-          thinking: chunkThinking,
-          ...(chunkImages.length > 0 ? { images: chunkImages } : {}),
-          ...(chunkAudio.length > 0 ? { audioChunks: chunkAudio } : {}),
-          ...(chunkFunctionCalls.length > 0 ? { functionCalls: chunkFunctionCalls } : {}),
+          text: c.text,
+          thinking: c.thinking,
+          ...(c.images.length > 0 ? { images: c.images } : {}),
+          ...(c.audioChunks.length > 0 ? { audioChunks: c.audioChunks } : {}),
+          ...(c.functionCalls.length > 0 ? { functionCalls: c.functionCalls } : {}),
         });
       }
     }
@@ -386,11 +408,7 @@ async function replayAndStream(
     if (!fetchResponse.ok) {
       const errorBody = await fetchResponse.text().catch(() => '');
       console.error(`[NetworkInterceptor:${reqId}] Replay failed: HTTP ${fetchResponse.status} — ${errorBody.substring(0, 500)}`);
-      chunkBuffer.push({
-        text: '', done: true,
-        error: `HTTP ${fetchResponse.status}`,
-        reqId, timestamp: Date.now(), source: 'replay',
-      });
+      pushChunk(reqId, 'replay', { done: true, error: `HTTP ${fetchResponse.status}` });
       // Fulfill the browser with the error response
       await route.fulfill({
         status: fetchResponse.status,
@@ -407,15 +425,10 @@ async function replayAndStream(
       const parsed = parseResponseChunks(body);
       for (const chunk of parsed) {
         if (chunk.text || chunk.thinking || chunk.images?.length || chunk.audioChunks?.length || chunk.functionCalls?.length) {
-          chunkBuffer.push({
-            text: chunk.text, thinking: chunk.thinking,
-            images: chunk.images, audioChunks: chunk.audioChunks,
-            functionCalls: chunk.functionCalls,
-            done: false, reqId, timestamp: Date.now(), source: 'replay',
-          });
+          pushChunk(reqId, 'replay', chunk);
         }
       }
-      chunkBuffer.push({ text: '', done: true, reqId, timestamp: Date.now(), source: 'replay' });
+      pushChunk(reqId, 'replay', { done: true });
     } else {
       // Stream the response body!
       const reader = fetchResponse.body.getReader();
@@ -439,38 +452,26 @@ async function replayAndStream(
 
         // Parse any new complete chunks from the accumulated text
         const result = parseIncrementalChunks(accumulated, parserState);
-        if (result.text || result.thinking || result.images.length || result.audioChunks.length || result.functionCalls.length) {
+        if (hasContent(result)) {
           streamedText += result.text;
           streamedThinking += result.thinking;
           streamedImages.push(...result.images);
           streamedAudio.push(...result.audioChunks);
           streamedFunctionCalls.push(...result.functionCalls);
-          chunkBuffer.push({
-            text: result.text, thinking: result.thinking,
-            images: result.images.length > 0 ? result.images : undefined,
-            audioChunks: result.audioChunks.length > 0 ? result.audioChunks : undefined,
-            functionCalls: result.functionCalls.length > 0 ? result.functionCalls : undefined,
-            done: false, reqId, timestamp: Date.now(), source: 'replay',
-          });
+          pushChunk(reqId, 'replay', result);
         }
       }
 
       // Final decode flush
       accumulated += decoder.decode().replace(/\0/g, '');
       const finalResult = parseIncrementalChunks(accumulated, parserState);
-      if (finalResult.text || finalResult.thinking || finalResult.images.length || finalResult.audioChunks.length || finalResult.functionCalls.length) {
+      if (hasContent(finalResult)) {
         streamedText += finalResult.text;
         streamedThinking += finalResult.thinking;
         streamedImages.push(...finalResult.images);
         streamedAudio.push(...finalResult.audioChunks);
         streamedFunctionCalls.push(...finalResult.functionCalls);
-        chunkBuffer.push({
-          text: finalResult.text, thinking: finalResult.thinking,
-          images: finalResult.images.length > 0 ? finalResult.images : undefined,
-          audioChunks: finalResult.audioChunks.length > 0 ? finalResult.audioChunks : undefined,
-          functionCalls: finalResult.functionCalls.length > 0 ? finalResult.functionCalls : undefined,
-          done: false, reqId, timestamp: Date.now(), source: 'replay',
-        });
+        pushChunk(reqId, 'replay', finalResult);
       }
 
       fullResponseBody = accumulated;
@@ -504,22 +505,17 @@ async function replayAndStream(
       const missingAudio = fullAudio.slice(streamedAudio.length);
       const missingFunctionCalls = fullFunctionCalls.slice(streamedFunctionCalls.length);
 
-      if (missingText || missingThinking || missingImages.length || missingAudio.length || missingFunctionCalls.length) {
+      const missing = { text: missingText, thinking: missingThinking, images: missingImages, audioChunks: missingAudio, functionCalls: missingFunctionCalls };
+      if (hasContent(missing)) {
         console.warn(
           `[NetworkInterceptor:${reqId}] Fallback parser recovered missing content: ` +
           `text=${missingText.length} chars, thinking=${missingThinking.length} chars, ` +
           `images=${missingImages.length}, audio=${missingAudio.length}, functionCalls=${missingFunctionCalls.length}`,
         );
-        chunkBuffer.push({
-          text: missingText, thinking: missingThinking,
-          images: missingImages.length > 0 ? missingImages : undefined,
-          audioChunks: missingAudio.length > 0 ? missingAudio : undefined,
-          functionCalls: missingFunctionCalls.length > 0 ? missingFunctionCalls : undefined,
-          done: false, reqId, timestamp: Date.now(), source: 'replay',
-        });
+        pushChunk(reqId, 'replay', missing);
       }
 
-      chunkBuffer.push({ text: '', done: true, reqId, timestamp: Date.now(), source: 'replay' });
+      pushChunk(reqId, 'replay', { done: true });
     }
 
     // Fulfill the browser route with the complete response
@@ -538,12 +534,9 @@ async function replayAndStream(
     console.log(`[NetworkInterceptor:${reqId}] Replay complete: ${fullResponseBody.length} bytes streamed`);
 
   } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
+    const msg = getErrorMessage(error);
     console.error(`[NetworkInterceptor:${reqId}] Replay error: ${msg}`);
-    chunkBuffer.push({
-      text: '', done: true, error: msg,
-      reqId, timestamp: Date.now(), source: 'replay',
-    });
+    pushChunk(reqId, 'replay', { done: true, error: msg });
     // Try to abort the route so the browser doesn't hang
     try {
       await route.abort('failed');
@@ -579,12 +572,9 @@ async function handleGenerateContentRoute(route: Route): Promise<void> {
     console.log(`[NetworkInterceptor:${reqId}] Route fired — replaying externally for streaming`);
     // Don't await — let it stream in the background while consumeStreamingChunks polls
     replayAndStream(route.request(), route, reqId).catch((error) => {
-      const msg = error instanceof Error ? error.message : String(error);
+      const msg = getErrorMessage(error);
       console.error(`[NetworkInterceptor:${reqId}] replayAndStream error: ${msg}`);
-      chunkBuffer.push({
-        text: '', done: true, error: msg,
-        reqId, timestamp: Date.now(), source: 'replay',
-      });
+      pushChunk(reqId, 'replay', { done: true, error: msg });
     });
   } else {
     // NON-STREAMING: pass through to browser, capture via response.body()
@@ -612,27 +602,17 @@ async function handleGenerateContentResponse(response: PlaywrightResponse, reqId
       const parsedChunks = parseResponseChunks(bodyText);
       for (const chunk of parsedChunks) {
         if (chunk.text || chunk.thinking || chunk.images?.length || chunk.audioChunks?.length || chunk.functionCalls?.length) {
-          chunkBuffer.push({
-            text: chunk.text,
-            thinking: chunk.thinking,
-            images: chunk.images,
-            audioChunks: chunk.audioChunks,
-            functionCalls: chunk.functionCalls,
-            done: false,
-            reqId,
-            timestamp: Date.now(),
-            source: 'response',
-          });
+          pushChunk(reqId, 'response', chunk);
         }
       }
-      chunkBuffer.push({ text: '', done: true, reqId, timestamp: Date.now(), source: 'response' });
+      pushChunk(reqId, 'response', { done: true });
     } else {
-      chunkBuffer.push({ text: '', done: true, error: `HTTP ${status}`, reqId, timestamp: Date.now(), source: 'response' });
+      pushChunk(reqId, 'response', { done: true, error: `HTTP ${status}` });
     }
   } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
+    const msg = getErrorMessage(error);
     console.error(`[NetworkInterceptor:${reqId}] Response handler error: ${msg}`);
-    chunkBuffer.push({ text: '', done: true, error: msg, reqId, timestamp: Date.now(), source: 'response' });
+    pushChunk(reqId, 'response', { done: true, error: msg });
   }
 }
 
@@ -702,13 +682,12 @@ export function hasRouteFired(): boolean {
 }
 
 /**
- * Consume streaming chunks from the replay buffer.
- * The external replay fetch pushes chunks to chunkBuffer as they arrive.
- * This generator polls the buffer with low latency for real-time streaming.
+ * Core chunk consumer — polls the buffer for chunks matching a request ID.
+ * Shared implementation for both streaming (15ms poll) and non-streaming (10ms poll) paths.
  */
-export async function* consumeStreamingChunks(
-  _page: Page,
+async function* consumeBufferChunks(
   reqId: string,
+  pollMs: number,
   abortSignal?: AbortSignal,
   timeoutMs = 300_000,
   initialDataTimeoutMs = 120_000,
@@ -716,7 +695,6 @@ export async function* consumeStreamingChunks(
   const startTime = Date.now();
   let gotAnyData = false;
   let lastActivityTime = Date.now();
-  const POLL_MS = 15; // 15ms poll — fast enough for real-time feel, low CPU
   const SILENCE_TIMEOUT_MS = 60_000;
 
   while (true) {
@@ -749,7 +727,7 @@ export async function* consumeStreamingChunks(
         yield { text: '', done: true };
         return;
       }
-      await new Promise(resolve => setTimeout(resolve, POLL_MS));
+      await new Promise(resolve => setTimeout(resolve, pollMs));
       continue;
     }
 
@@ -769,64 +747,23 @@ export async function* consumeStreamingChunks(
 }
 
 /**
- * Consume chunks from the Node-side buffer (for non-streaming).
- * Polls the response.body() buffer.
+ * Consume streaming chunks from the replay buffer (15ms poll for real-time feel).
+ */
+export async function* consumeStreamingChunks(
+  _page: Page, reqId: string, abortSignal?: AbortSignal,
+  timeoutMs = 300_000, initialDataTimeoutMs = 120_000,
+): AsyncGenerator<StreamChunk> {
+  yield* consumeBufferChunks(reqId, 15, abortSignal, timeoutMs, initialDataTimeoutMs);
+}
+
+/**
+ * Consume chunks from the Node-side buffer for non-streaming (10ms poll).
  */
 export async function* consumeChunks(
-  _page: Page,
-  reqId: string,
-  abortSignal?: AbortSignal,
-  timeoutMs = 300_000,
-  initialDataTimeoutMs = 120_000,
+  _page: Page, reqId: string, abortSignal?: AbortSignal,
+  timeoutMs = 300_000, initialDataTimeoutMs = 120_000,
 ): AsyncGenerator<StreamChunk> {
-  const startTime = Date.now();
-  let gotAnyData = false;
-  let lastActivityTime = Date.now();
-  const POLL_MS = 10;
-  const SILENCE_TIMEOUT_MS = 60_000;
-
-  while (true) {
-    if (abortSignal?.aborted) { yield { text: '', done: true }; return; }
-
-    if (!gotAnyData && Date.now() - startTime > initialDataTimeoutMs) {
-      yield { text: '', done: true, error: 'no_data' };
-      return;
-    }
-    if (Date.now() - startTime > timeoutMs) {
-      yield { text: '', done: true, error: 'Stream timeout' };
-      return;
-    }
-
-    const matchingChunks: BufferChunk[] = [];
-    const remaining: BufferChunk[] = [];
-    for (const chunk of chunkBuffer) {
-      if (chunk.reqId === reqId) matchingChunks.push(chunk);
-      else remaining.push(chunk);
-    }
-    chunkBuffer = remaining;
-
-    if (matchingChunks.length === 0) {
-      if (gotAnyData && Date.now() - lastActivityTime > SILENCE_TIMEOUT_MS) {
-        yield { text: '', done: true };
-        return;
-      }
-      await new Promise(resolve => setTimeout(resolve, POLL_MS));
-      continue;
-    }
-
-    lastActivityTime = Date.now();
-
-    for (const chunk of matchingChunks) {
-      if (chunk.error) { yield { text: '', done: true, error: chunk.error }; return; }
-      if (chunk.done && !chunk.text && !chunk.thinking && !chunk.images?.length && !chunk.audioChunks?.length && !chunk.functionCalls?.length) { yield { text: '', done: true }; return; }
-      if (chunk.functionCalls?.length) { gotAnyData = true; yield { text: '', functionCalls: chunk.functionCalls, done: false }; }
-      if (chunk.images?.length) { gotAnyData = true; yield { text: '', images: chunk.images, done: false }; }
-      if (chunk.audioChunks?.length) { gotAnyData = true; yield { text: '', audioChunks: chunk.audioChunks, done: false }; }
-      if (chunk.text) { gotAnyData = true; yield { text: chunk.text, done: false }; }
-      if (chunk.thinking) { gotAnyData = true; yield { text: '', thinking: chunk.thinking, done: false }; }
-      if (chunk.done) { yield { text: '', done: true }; return; }
-    }
-  }
+  yield* consumeBufferChunks(reqId, 10, abortSignal, timeoutMs, initialDataTimeoutMs);
 }
 
 export function resetInterceptorState(): void {

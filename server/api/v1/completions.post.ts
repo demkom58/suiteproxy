@@ -17,6 +17,7 @@ import {
   NoAccountsError,
   ClientDisconnectedError,
 } from '~~/server/lib/browser/errors';
+import { generateOpenAIId, getErrorMessage } from '~~/server/utils/helpers';
 
 // ── Model Aliases (same as chat completions) ────────────────────────────
 const MODEL_ALIASES: Record<string, string> = {
@@ -77,7 +78,7 @@ export default defineEventHandler(async (event) => {
       'X-Request-Id': reqId,
     });
 
-    const chatId = `cmpl-${crypto.randomUUID().replace(/-/g, '').substring(0, 24)}`;
+    const chatId = generateOpenAIId('cmpl');
     const created = Math.floor(Date.now() / 1000);
     const model = resolvedModel.startsWith('models/') ? resolvedModel : `models/${resolvedModel}`;
 
@@ -132,7 +133,7 @@ export default defineEventHandler(async (event) => {
             }
           }
         } catch (error) {
-          const errMsg = error instanceof Error ? error.message : String(error);
+          const errMsg = getErrorMessage(error);
           console.error(`[Completions:${reqId}] Stream error:`, errMsg);
           const errorChunk = {
             id: chatId,
@@ -172,7 +173,7 @@ export default defineEventHandler(async (event) => {
     const completionTokens = estimateTokens(result.text);
 
     const response: OpenAICompletionsResponse = {
-      id: `cmpl-${crypto.randomUUID().replace(/-/g, '').substring(0, 24)}`,
+      id: generateOpenAIId('cmpl'),
       object: 'text_completion',
       created: Math.floor(Date.now() / 1000),
       model: resolvedModel,
@@ -193,7 +194,7 @@ export default defineEventHandler(async (event) => {
     return response;
 
   } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
+    const msg = getErrorMessage(error);
     console.error(`[LegacyCompletions:${reqId}] Error:`, msg);
 
     if (error instanceof AuthenticationError) {

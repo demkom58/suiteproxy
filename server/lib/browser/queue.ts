@@ -28,6 +28,26 @@ import { injectPromptHistory, removeInjectorRoutes, triggerGeneration } from './
 import { deleteDriveFiles, type DriveAuthCredentials } from './drive-uploader';
 import { generateSpeech } from './tts-controller';
 import { logRequestUpdate } from '~~/server/utils/request-log';
+import { generateOpenAIId } from '~~/server/utils/helpers';
+
+// ── SSE Helpers ─────────────────────────────────────────────────────────
+
+/** Build an OpenAI-format SSE chunk object. */
+function buildSSEChunk(
+  chatId: string,
+  created: number,
+  model: string,
+  delta: Record<string, unknown>,
+  finishReason: string | null,
+): string {
+  return JSON.stringify({
+    id: chatId,
+    object: 'chat.completion.chunk',
+    created,
+    model,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  });
+}
 
 // ── Queue State (survives hot reloads) ──────────────────────────────────
 declare global {
@@ -84,7 +104,7 @@ export async function* enqueueStreamingRequest(
 
   // We need a different approach for streaming:
   // Execute through the queue but yield SSE chunks as they arrive
-  const chatId = `chatcmpl-${crypto.randomUUID().replace(/-/g, '').substring(0, 24)}`;
+  const chatId = generateOpenAIId('chatcmpl');
   const model = context.model.startsWith('models/') ? context.model : `models/${context.model}`;
   const created = Math.floor(Date.now() / 1000);
 
@@ -128,18 +148,7 @@ export async function* enqueueStreamingRequest(
     // Emit thinking/reasoning content as a separate SSE chunk with reasoning_content field
     // (DeepSeek/Gemini convention used by most OpenAI-compatible clients)
     if (chunk.thinking) {
-      const thinkingData = {
-        id: chatId,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{
-          index: 0,
-          delta: { reasoning_content: chunk.thinking },
-          finish_reason: null,
-        }],
-      };
-      yield `data: ${JSON.stringify(thinkingData)}\n\n`;
+      yield `data: ${buildSSEChunk(chatId, created, model, { reasoning_content: chunk.thinking }, null)}\n\n`;
     }
 
     // Emit function calls as OpenAI-format streaming tool_calls
@@ -152,75 +161,31 @@ export async function* enqueueStreamingRequest(
       hadFunctionCalls = true;
       const toolCalls = chunk.functionCalls.map((fc, idx) => ({
         index: idx,
-        id: `call_${crypto.randomUUID().replace(/-/g, '').substring(0, 24)}`,
+        id: generateOpenAIId('call'),
         type: 'function' as const,
         function: {
           name: fc.name,
           arguments: JSON.stringify(fc.args),
         },
       }));
-      const toolCallData = {
-        id: chatId,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{
-          index: 0,
-          delta: { tool_calls: toolCalls },
-          finish_reason: null,
-        }],
-      };
-      yield `data: ${JSON.stringify(toolCallData)}\n\n`;
+      yield `data: ${buildSSEChunk(chatId, created, model, { tool_calls: toolCalls }, null)}\n\n`;
     }
 
     // Emit inline images as content parts (from image-generation models)
     if (chunk.images?.length) {
       for (const img of chunk.images) {
-        const imageData = {
-          id: chatId,
-          object: 'chat.completion.chunk',
-          created,
-          model,
-          choices: [{
-            index: 0,
-            delta: {
-              content: [{ type: 'image_url', image_url: { url: `data:${img.mimeType};base64,${img.data}` } }],
-            },
-            finish_reason: null,
-          }],
-        };
-        yield `data: ${JSON.stringify(imageData)}\n\n`;
+        yield `data: ${buildSSEChunk(chatId, created, model, {
+          content: [{ type: 'image_url', image_url: { url: `data:${img.mimeType};base64,${img.data}` } }],
+        }, null)}\n\n`;
       }
     }
 
     if (chunk.delta) {
-      const sseData = {
-        id: chatId,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{
-          index: 0,
-          delta: { content: chunk.delta },
-          finish_reason: null,
-        }],
-      };
-      yield `data: ${JSON.stringify(sseData)}\n\n`;
+      yield `data: ${buildSSEChunk(chatId, created, model, { content: chunk.delta }, null)}\n\n`;
     }
 
     if (chunk.done) {
-      const finalData = {
-        id: chatId,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{
-          index: 0,
-          delta: {},
-          finish_reason: hadFunctionCalls ? 'tool_calls' : 'stop',
-        }],
-      };
-      yield `data: ${JSON.stringify(finalData)}\n\n`;
+      yield `data: ${buildSSEChunk(chatId, created, model, {}, hadFunctionCalls ? 'tool_calls' : 'stop')}\n\n`;
       yield `data: [DONE]\n\n`;
       return;
     }
@@ -229,18 +194,7 @@ export async function* enqueueStreamingRequest(
   // Safety: if the generator ended without a done chunk, send [DONE] anyway
   // This prevents the client from hanging indefinitely
   console.warn(`[Queue] Stream generator for ${context.reqId} ended without done signal — sending [DONE]`);
-  const finalData = {
-    id: chatId,
-    object: 'chat.completion.chunk',
-    created,
-    model,
-    choices: [{
-      index: 0,
-      delta: {},
-      finish_reason: hadFunctionCalls ? 'tool_calls' : 'stop',
-    }],
-  };
-  yield `data: ${JSON.stringify(finalData)}\n\n`;
+  yield `data: ${buildSSEChunk(chatId, created, model, {}, hadFunctionCalls ? 'tool_calls' : 'stop')}\n\n`;
   yield `data: [DONE]\n\n`;
 }
 

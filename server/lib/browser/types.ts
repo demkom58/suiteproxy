@@ -2,6 +2,7 @@
  * Types for the browser automation layer.
  */
 import type { Browser, BrowserContext, Page } from 'playwright-core';
+import type { OpenAIChatMessage } from '~~/server/types/openai';
 
 // ── Browser State ───────────────────────────────────────────────────────
 export interface BrowserState {
@@ -31,24 +32,8 @@ export interface ThinkingDirective {
   level: ThinkingLevel | null;
 }
 
-// ── OpenAI Message (subset for context passing) ─────────────────────────
-export interface ChatMessage {
-  role: 'user' | 'assistant' | 'system' | 'tool';
-  content: string | null | Array<
-    | { type: 'text'; text: string }
-    | { type: 'image_url'; image_url: { url: string } }
-  >;
-  /** Tool call ID — for role='tool' (function result). */
-  tool_call_id?: string;
-  /** Function name — for role='tool'. */
-  name?: string;
-  /** Tool calls made by the assistant. */
-  tool_calls?: Array<{
-    id: string;
-    type: 'function';
-    function: { name: string; arguments: string };
-  }>;
-}
+// Re-export OpenAIChatMessage as ChatMessage for backward compatibility
+export type { OpenAIChatMessage as ChatMessage } from '~~/server/types/openai';
 
 // ── Gemini Function Declaration (mapped from OpenAI tools) ──────────────
 export interface GeminiFunctionDeclaration {
@@ -72,7 +57,7 @@ export interface RequestContext {
   /** @deprecated Use `messages` instead. Kept for backward compat. */
   prompt: string;
   /** Structured messages for multi-turn (preferred over prompt) */
-  messages?: ChatMessage[];
+  messages?: OpenAIChatMessage[];
   systemInstruction?: string;
   stream: boolean;
   temperature?: number;

@@ -33,6 +33,7 @@ import {
   NoAccountsError,
   ClientDisconnectedError,
 } from '~~/server/lib/browser/errors';
+import { generateOpenAIId, getErrorMessage } from '~~/server/utils/helpers';
 import { logRequestStart, logRequestEnd, logRequestUpdate } from '~~/server/utils/request-log';
 
 // ── Model Aliases ───────────────────────────────────────────────────────
@@ -146,7 +147,7 @@ export default defineEventHandler(async (event) => {
           }
           logRequestEnd(reqId, { statusCode: 200 });
         } catch (error) {
-          const errMsg = error instanceof Error ? error.message : String(error);
+          const errMsg = getErrorMessage(error);
           logRequestEnd(reqId, { statusCode: 500, error: errMsg });
           console.error(`[Completions:${reqId}] Stream error:`, errMsg);
 
@@ -194,7 +195,7 @@ export default defineEventHandler(async (event) => {
       : buildResponseContent(result.text, result.images);
 
     const response: OpenAIChatResponse = {
-      id: `chatcmpl-${crypto.randomUUID().replace(/-/g, '').substring(0, 24)}`,
+      id: generateOpenAIId('chatcmpl'),
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
       model: resolvedModel,
@@ -227,7 +228,7 @@ export default defineEventHandler(async (event) => {
     return response;
 
   } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
+    const msg = getErrorMessage(error);
     console.error(`[Completions:${reqId}] Error:`, msg);
 
     let statusCode = 502;
@@ -529,7 +530,7 @@ function buildToolCalls(
   if (!functionCalls || functionCalls.length === 0) return undefined;
 
   return functionCalls.map((fc) => ({
-    id: `call_${crypto.randomUUID().replace(/-/g, '').substring(0, 24)}`,
+    id: generateOpenAIId('call'),
     type: 'function' as const,
     function: {
       name: fc.name,

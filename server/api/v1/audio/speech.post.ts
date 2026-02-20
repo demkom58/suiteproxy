@@ -20,6 +20,7 @@ import {
   RateLimitError,
   NoAccountsError,
 } from '~~/server/lib/browser/errors';
+import { getErrorMessage } from '~~/server/utils/helpers';
 
 export default defineEventHandler(async (event) => {
   const body = await readBody<OpenAIAudioSpeechRequest>(event);
@@ -90,7 +91,7 @@ export default defineEventHandler(async (event) => {
       throw error;
     }
 
-    const msg = error instanceof Error ? error.message : String(error);
+    const msg = getErrorMessage(error);
     console.error(`[TTS:${reqId}] Error:`, msg);
 
     if (error instanceof AuthenticationError) {
