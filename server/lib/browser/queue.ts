@@ -301,6 +301,16 @@ function shouldUseInjection(ctx: RequestContext): boolean {
   // The textarea path doesn't control GenerateContentConfig fields like responseModalities
   if (ctx.responseModalities && ctx.responseModalities.length > 0) return true;
 
+  // Structured output (json_object / json_schema) → must use injection
+  // Only the injection path embeds responseMimeType in GenerateContentConfig
+  if (ctx.responseFormat && ctx.responseFormat.type !== 'text') return true;
+
+  // Function calling → must use injection (functionDeclarations in GenerateContentConfig)
+  if (ctx.functionDeclarations && ctx.functionDeclarations.length > 0) return true;
+
+  // Code execution → must use injection (codeExecution in GenerateContentConfig)
+  if (ctx.enableCodeExecution) return true;
+
   // Count non-system messages — if more than 1, it's multi-turn
   const nonSystemMessages = ctx.messages.filter(m => m.role !== 'system');
   return nonSystemMessages.length > 1;

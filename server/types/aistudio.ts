@@ -43,6 +43,92 @@ export enum ResponseModality {
   DOCUMENT = 4,
 }
 
+// ── Schema Wire Format ──────────────────────────────────────────────────
+// AI Studio's gRPC-web wire format represents JSON Schema as positional arrays.
+// Each schema node is a variable-length array where index = proto field_number - 1.
+// String type names ("string", "object") must be converted to numeric enums.
+
+/** Proto Type enum for Schema nodes in the wire format. */
+export enum SchemaType {
+  STRING = 1,
+  NUMBER = 2,
+  INTEGER = 3,
+  BOOLEAN = 4,
+  ARRAY = 5,
+  OBJECT = 6,
+}
+
+const JSON_SCHEMA_TYPE_MAP: Record<string, SchemaType> = {
+  string: SchemaType.STRING,
+  number: SchemaType.NUMBER,
+  integer: SchemaType.INTEGER,
+  boolean: SchemaType.BOOLEAN,
+  array: SchemaType.ARRAY,
+  object: SchemaType.OBJECT,
+};
+
+/**
+ * Convert a JSON Schema object into the gRPC-web positional array format
+ * expected by MakerSuiteService/GenerateContent.
+ *
+ * Wire format positions:
+ *   [0]  type              (numeric enum: 1=string, 2=number, ..., 6=object)
+ *   [1]  format            (string, e.g. "enum")
+ *   [2]  description       (string)
+ *   [3]  nullable          (boolean)
+ *   [4]  enum              (string[])
+ *   [5]  items             (Schema — for arrays)
+ *   [6]  properties        (Array<[name, Schema]> — for objects)
+ *   [7]  required          (string[])
+ *   ...trailing positions for min/max/pattern/etc...
+ *   [22] property_ordering (string[] — all property names in order)
+ */
+export function jsonSchemaToWire(schema: Record<string, unknown>): unknown[] {
+  const typeStr = schema.type as string | undefined;
+  const typeNum = typeStr ? JSON_SCHEMA_TYPE_MAP[typeStr] : null;
+
+  // Start with 23 slots (up to property_ordering at index 22)
+  const node: unknown[] = new Array(23).fill(null);
+  node[0] = typeNum;
+
+  // [1] format
+  if (schema.format) node[1] = schema.format;
+
+  // [2] description
+  if (schema.description) node[2] = schema.description;
+
+  // [3] nullable
+  if (schema.nullable) node[3] = schema.nullable;
+
+  // [4] enum values
+  if (schema.enum && Array.isArray(schema.enum)) node[4] = schema.enum;
+
+  // [5] items — for ARRAY type
+  if (typeStr === 'array' && schema.items && typeof schema.items === 'object') {
+    node[5] = jsonSchemaToWire(schema.items as Record<string, unknown>);
+  }
+
+  // [6] properties — for OBJECT type (as [name, wireSchema] pairs)
+  // [7] required
+  // [22] property_ordering
+  if (typeStr === 'object' && schema.properties && typeof schema.properties === 'object') {
+    const props = schema.properties as Record<string, unknown>;
+    const keys = Object.keys(props);
+    node[6] = keys.map(k => [k, jsonSchemaToWire(props[k] as Record<string, unknown>)]);
+    if (schema.required && Array.isArray(schema.required) && (schema.required as string[]).length > 0) {
+      node[7] = schema.required;
+    }
+    node[22] = keys; // property_ordering
+  }
+
+  // Trim trailing nulls for compact representation
+  while (node.length > 1 && node[node.length - 1] === null) {
+    node.pop();
+  }
+
+  return node;
+}
+
 // ── Generation Config ───────────────────────────────────────────────────
 
 export interface GenerateContentConfig {
@@ -277,7 +363,7 @@ export function createGenerationConfig(
     ],
     mimeType: options.responseMimeType ?? 'text/plain',
     codeExecution: options.codeExecution ? 1 : null,
-    responseSchema: options.responseSchema ?? null,
+    responseSchema: options.responseSchema ? jsonSchemaToWire(options.responseSchema) : null,
     functionDeclarations: options.functionDeclarations ?? null,
     unknow12: null,
     unknow13: null,
