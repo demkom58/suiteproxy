@@ -760,7 +760,8 @@ async function handleTier2Recovery(_ctx: RequestContext, error: Error): Promise<
     }
   }
 
-  // Close browser completely
+  // Close browser completely and reset pending account selection
+  pendingAccountId = null;
   try {
     await closeBrowser();
     globalThis._currentPage = null;
@@ -777,6 +778,14 @@ interface AccountForRequest {
   fingerprint: string | null;
   proxy: string | null;
 }
+
+/**
+ * Pending account selection — prevents concurrent requests from picking
+ * different accounts when no browser is running. The first request sets
+ * this, and concurrent requests reuse it until the browser launches and
+ * sets currentAccountId properly.
+ */
+let pendingAccountId: string | null = null;
 
 function getAccountForRequest(
   _ctx: RequestContext,
@@ -796,6 +805,19 @@ function getAccountForRequest(
     if (current) return current;
   }
 
+  // If another concurrent request already selected an account (browser not yet
+  // launched), reuse the same one to avoid cross-account slot conflicts.
+  if (pendingAccountId) {
+    const pending = db.prepare(`
+      SELECT id, creds, fingerprint, proxy FROM accounts
+      WHERE id = ? AND limited_until < ?
+    `).get(pendingAccountId, now) as AccountForRequest | null;
+
+    if (pending) return pending;
+    // Pending account is now rate-limited, clear it and pick a new one
+    pendingAccountId = null;
+  }
+
   // Current account is rate-limited or no browser running — pick next available
   const account = db.prepare(`
     SELECT id, creds, fingerprint, proxy FROM accounts
@@ -812,8 +834,12 @@ function getAccountForRequest(
       LIMIT 1
     `).get() as AccountForRequest | null;
 
+    if (anyAccount) pendingAccountId = anyAccount.id;
     return anyAccount;
   }
+
+  // Record selection so concurrent requests use the same account
+  pendingAccountId = account.id;
 
   // Update last_sync so when we DO switch, the next account is fair
   db.prepare('UPDATE accounts SET last_sync = ? WHERE id = ?')

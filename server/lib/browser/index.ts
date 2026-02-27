@@ -74,10 +74,24 @@ export async function ensureBrowser(
     await closeBrowser();
   }
 
-  // Dedup concurrent launches
+  // Dedup concurrent launches — wait for the in-flight launch to finish,
+  // then re-check if the launched browser matches our account.
   if (globalThis._browserLaunchPromise) {
     await globalThis._browserLaunchPromise;
-    return;
+    // Re-check: the browser may have been launched for a different account.
+    const stateAfterWait = getState();
+    if (stateAfterWait.browser && stateAfterWait.context) {
+      if (stateAfterWait.currentAccountId === accountId) {
+        return; // Browser is ready for our account
+      }
+      // Browser was launched for a different account — all slots share one context,
+      // so we can't have mixed accounts. Log a warning but reuse (the caller's
+      // cookies won't be injected — pages will use the context's cookies).
+      console.warn(`[Browser] Concurrent launch: browser is for ${stateAfterWait.currentAccountId}, ` +
+        `but ${accountId} requested. Reusing existing context.`);
+      return;
+    }
+    // Browser launch failed or was closed — fall through to launch our own
   }
 
   globalThis._browserLaunchPromise = launchBrowserAndContext(cookieStr, accountId, authUser, launchConfig);
