@@ -24,6 +24,7 @@ import {
 } from './errors';
 import { isRateLimitError } from './errors';
 import { saveErrorSnapshot } from './snapshots';
+import { cleanupPageState } from './network-interceptor';
 import { injectPromptHistory, removeInjectorRoutes, triggerGeneration } from './prompt-injector';
 import { resolveThinking } from './prompt-builder';
 import { deleteDriveFiles, type DriveAuthCredentials } from './drive-uploader';
@@ -380,9 +381,14 @@ async function executeRequestViaTextarea(ctx: RequestContext): Promise<QueueResu
     // Ensure generation is fully stopped before next request
     await controller.ensureGenerationStopped();
 
-    // Update slot conversation cache — include all messages (current + response)
-    const fullHash = computeFullConversationHash(ctx.messages);
-    releaseSlot(slot, fullHash, ctx.messages?.length ?? 0, slot.currentModel);
+    // Close page to force fresh BotGuard init on next request
+    try {
+      cleanupPageState(page);
+      await page.close();
+    } catch { /* page may already be closed */ }
+    slot.page = null;
+    slot.isReady = false;
+    releaseSlot(slot, null, 0, slot.currentModel);
 
     return result;
   } catch (error) {
@@ -598,20 +604,30 @@ async function* wrapStreamWithCleanup(
     }
   } finally {
     await removeInjectorRoutes(page, reqId);
-    // Skip navigate-back — the next injection will page.goto() its own prompt URL.
-    // This saves 2-3s per request.
-    // Update conversation cache and release slot
-    const fullHash = computeFullConversationHash(messages);
-    releaseSlot(slot, fullHash, messages?.length ?? 0, slot.currentModel);
-    // Delete uploaded Drive files (non-blocking cleanup)
+
+    // Delete uploaded Drive files BEFORE closing the page (needs page context)
     if (cleanup?.driveFileIds?.length) {
       deleteDriveFiles(page, cleanup.driveFileIds, reqId, cleanup.driveCreds).catch(() => {});
     }
+
+    // Close the page after each request so the next request gets a fresh one
+    // with fresh BotGuard/WAA initialization. Google invalidates the session's
+    // BotGuard nonce after a GenerateContent call, causing subsequent requests
+    // on the same page to fail with 403 "permission denied".
+    try {
+      cleanupPageState(page);
+      await page.close();
+    } catch { /* page may already be closed */ }
+    slot.page = null;
+    slot.isReady = false;
+
+    // Release slot (no conversation caching — fresh page each time)
+    releaseSlot(slot, null, 0, slot.currentModel);
   }
 }
 
 /**
- * Wrap a stream generator with slot release on completion (for textarea path).
+ * Wrap a stream generator with page recycling and slot release (for textarea path).
  */
 async function* wrapStreamWithSlotRelease(
   inner: AsyncGenerator<StreamDelta>,
@@ -624,8 +640,16 @@ async function* wrapStreamWithSlotRelease(
       if (chunk.done) return;
     }
   } finally {
-    const fullHash = computeFullConversationHash(messages);
-    releaseSlot(slot, fullHash, messages?.length ?? 0, slot.currentModel);
+    // Close page to force fresh BotGuard init on next request
+    if (slot.page) {
+      try {
+        cleanupPageState(slot.page);
+        await slot.page.close();
+      } catch { /* page may already be closed */ }
+      slot.page = null;
+      slot.isReady = false;
+    }
+    releaseSlot(slot, null, 0, slot.currentModel);
   }
 }
 
